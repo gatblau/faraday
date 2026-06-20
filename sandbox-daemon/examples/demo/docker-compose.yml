@@ -1,0 +1,19 @@
+# Local validation harness for the faradayd developer-machine demo (Plan 04 Phase 4).
+# Brings up an OIDC provider (Dex) and a dummy REST API (go-httpbin) so you can drive the
+# full chain from Claude Code: python_sandbox → mcp-stdio → daemon → broker → dummy API,
+# with a real browser sign-in against Dex. Not shipped — a dev convenience only.
+services:
+  dex:
+    image: dexidp/dex:v2.45.1
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    ports:
+      - "5556:5556"
+    volumes:
+      - ./dex-config.yaml:/etc/dex/config.yaml:ro
+
+  # A stand-in "corporate API" the sandbox calls through the broker. go-httpbin returns
+  # deterministic JSON (GET /json) and echoes requests (GET /anything/...).
+  dummy-api:
+    image: mccutchen/go-httpbin:v2.15.0
+    ports:
+      - "8080:8080"

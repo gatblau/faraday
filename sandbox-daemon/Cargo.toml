@@ -1,0 +1,49 @@
+# faradayd — host-resident sandbox daemon. Spec: docs/spec/sandbox-daemon/.
+# Phase 0 (docs/wip/plan/02-sandbox-daemon-build.md) establishes the buildable
+# single-binary layout that boots, binds a 0600 control socket, writes the 0600
+# connection-token file, and answers a health check. Later phases fill the modules.
+[package]
+name = "faradayd"
+version = "0.1.0"
+edition = "2021"
+description = "Host-resident sandbox daemon — see docs/design/sandbox-daemon/"
+publish = false
+
+[lib]
+name = "faradayd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "faradayd"
+path = "src/main.rs"
+
+[features]
+# Gates the integration tests (real interfaces; brought up per the plan).
+integration = []
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+hmac = "0.12"
+sha2 = "0.10"
+# HTTP client for the obo-broker exchange (C9) and the direct downstream call (C10).
+# default-tls (native-tls) is used for build portability on the dev host; revisiting
+# rustls for the reproducible cross-platform build pipeline is tracked as a follow-up.
+reqwest = { version = "0.12", features = ["json"] }
+# OIDC RP for the daemon-owned sign-in/step-up (C8): id_token signature + claim validation.
+jsonwebtoken = "9"
+base64 = "0.22"
+getrandom = "0.2"
+# C12 SandboxRuntime: the WASM isolation boundary (hardened config, fuel/epoch/memory,
+# single host import). async_support is used so the broker call shim can be async.
+wasmtime = "45.0.1"
+wasmtime-wasi = "45"
+
+[dev-dependencies]
+# `process` (dev-only) lets the mcp integration test spawn the real `mcp-stdio` sub-mode
+# as a child and drive it over stdio; the production binary does not depend on it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "time", "process"] }
+# Real-service integration gate (Phases 3/4): mockserver + Dex brought up via testcontainers.
+testcontainers = "0.24"

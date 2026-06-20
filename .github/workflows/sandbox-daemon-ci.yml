@@ -1,0 +1,31 @@
+name: sandbox-daemon CI
+on: { push: {}, pull_request: {} }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: sandbox-daemon } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy,rustfmt,llvm-tools-preview, targets: wasm32-wasip1 }
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --all-targets
+      # Run the suite under source-based coverage. llvm-cov runs the same tests as
+      # `cargo test` (Docker required for testcontainers — RISK-003) and fails the
+      # job on any test failure; the extra report steps reuse the same profdata.
+      - run: cargo llvm-cov --no-report --features integration
+      - run: cargo llvm-cov report --summary-only
+      - run: cargo llvm-cov report --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@v4
+        with: { name: coverage-lcov, path: sandbox-daemon/lcov.info }
+
+  security:
+    # Dependency-advisory, licence, ban, and source gate (cargo-deny, ADR-018).
+    # No build or Docker needed, so it runs in parallel with `build`.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with: { manifest-path: sandbox-daemon/Cargo.toml, command: check }

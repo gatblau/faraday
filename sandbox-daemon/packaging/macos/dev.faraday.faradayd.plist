@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Per-user launchd agent for faradayd (ADR-030): always-on, restarted on crash, so the
+  `mcp-stdio` sub-mode always finds the daemon. Installed to ~/Library/LaunchAgents by the
+  package postinstall, which substitutes __PROGRAM__ (the installed binary) and __LOGDIR__.
+  This checked-in copy is the lint/reference template (plutil -lint).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.faraday.faradayd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROGRAM__</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__LOGDIR__/faradayd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOGDIR__/faradayd.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,71 @@
+# Phase 1 — Analysis & Ambiguity Resolution (`sandbox-daemon`)
+
+## Table of contents
+- [1A — Assumptions Register](#1a--assumptions-register)
+- [1B — Open Questions](#1b--open-questions)
+- [1C — Glossary](#1c--glossary)
+
+## 1A — Assumptions Register
+
+| ID | Area | Assumption | Rationale | Impact if wrong |
+|---|---|---|---|---|
+| AS-1 | Language/runtime | The entire daemon is **Rust**, one binary; async on **tokio**. | HLD ADR-026. | Re-scaffold; component contracts unaffected. |
+| AS-2 | Daemon process model | A **single per-user daemon** process; the Sandbox Runtime is an in-process Wasmtime instance by default, with a build-time option to run it as a child process for memory isolation. | HLD ADR-023/ADR-010. | Switch to child-process runtime; IPC contract added. |
+| AS-3 | Service lifecycle | Installed as a **per-user, always-on OS service** (launchd user agent with `RunAtLoad`+`KeepAlive` on macOS; per-user Windows service / login task; systemd user unit on Linux), started at login and kept alive — so the `mcp-stdio` sub-mode (C16) always finds it. Registered + the MCP client config merged by the per-platform service installer (ADR-030/ADR-031). | HLD ADR-023/ADR-030/ADR-031. | Always-on; no contract change. |
+| AS-4 | Control transport | A **local socket** only — UDS at `$XDG_RUNTIME_DIR/faradayd.sock` (`0600`) on Linux/macOS, a named pipe with a per-user SID ACL on Windows. **No network listener.** | HLD ADR-023. | Path/ACL change; no contract change. |
+| AS-5 | Agent entry | One `run(code, requestedCapabilities[, dryRun])` entry, framed as a faraday-native length-prefixed JSON RPC on the control socket. The **single MCP tool** (`python_sandbox`) is served by the separate **`faradayd mcp-stdio` sub-mode (C16, ADR-028)**, which connects to the socket as an ordinary client — not in-endpoint framing. No per-API tools, no per-IDE plugin. | HLD ADR-023 / ADR-001 / ADR-028. | Adjust framing; the `run` contract is stable. |
+| AS-6 | Client authentication | Peer-UID check (`SO_PEERCRED`/`getpeereid`/`GetNamedPipeClientProcessId`) **and** a 128-bit CSPRNG **connection token** written to a `0600` runtime file at startup and presented on connect; optional first-connect consent for a new client identity. | HLD ADR-024. | Weaker client auth — security-critical; covered by tests + pen test. |
+| AS-7 | Sessions | A **session** is keyed by `(clientId, workspaceId)` supplied at connect; consent decisions and the per-session call budget are scoped to it; in-memory only. | HLD ADR-023. | Cross-session consent/budget leakage. |
+| AS-8 | Interactive auth | Sign-in / consent / step-up are delivered as a typed **`interaction_required`** message rendered by a **daemon-owned UI**; sign-in is concretely the **browser authorization-code + PKCE flow on a transient `127.0.0.1:<ephemeral>` loopback redirect** (ADR-029, generic OIDC discovery), with the `id_token` captured in the daemon only; consent via a native dialog/tray; MCP elicitation / CLI as optional alternatives. Local-desktop topology assumed (browser + loopback available); device-code is the recorded remote-topology fallback. | HLD ADR-025/ADR-029. | UI mechanism change; protocol unaffected. |
+| AS-9 | Headless posture | A caller with no UI and no elicitation runs **non-interactively**: pre-granted consent via admin-signed policy and/or mock / non-sensitive-credentials mode; a sensitive (write) real-credential call without a renderer **fails closed**. | HLD ADR-025 / ADR-016. | Headless callers blocked on sensitive writes (intended). |
+| AS-10 | Isolation contract | The Wasmtime guest is instantiated with **no ambient authority** — exactly **one capability host import** (the broker call shim) plus a hardened **deny-by-default WASI subset** (monotonic clock, randomness, captured stdout/stderr only — no filesystem, sockets, env, or args); fuel (CPU), max linear memory (default 512 MiB), and an epoch deadline (default 30 s) bound resources; hardened Wasmtime config validated fail-closed at startup. | HLD ADR-013/ADR-019 (rev 0.3.1). | Isolation regression — security-critical. |
+| AS-11 | Guest contract | Agent Python is RustPython compiled to WASM; the supported surface is the stdlib data-manipulation set (`json`, `re`, `datetime`, `base64`, `collections`, `itertools`, string/dict/list ops, control flow) plus `pysandbox_sdk`; networking/`os`/`socket`/native modules are absent by construction. | HLD ADR-014. | Agent code using out-of-contract modules fails by design. |
+| AS-12 | Capability handles | Opaque 128-bit `capId`s, valid for one run (≤5 min), bound to the daemon instance + connection token, non-replayable off-device. | HLD ADR-004/ADR-024. | Replayable handles — security-critical. |
+| AS-13 | Tokens | User tokens reside only in the daemon's memory and the OS keychain; never on disk in plaintext, never logged, never marshalled into the sandbox. Privileged downstream tokens live on the backend `obo-broker`, never on the workstation. | HLD ADR-002/ADR-010. | Token-leak vector reopens — security-critical. |
+| AS-14 | Backend OBO | Corporate-API capabilities route to the backend `obo-broker` via `POST /v1/exchange` with the user `id_token`; the daemon never holds a confidential-client credential. | HLD ADR-005; `../obo-broker/`. | Direct-token path reopens. |
+| AS-15 | Direct providers | Non-exchange providers (e.g. `github`) are called directly by the daemon's broker with a held token; the daemon manifest is the **sole** enforcement point for these (no server-side re-check). | HLD ADR-021 / 04-domain. | Manifest tampering widens authority — security-critical. |
+| AS-16 | Policy manifest | The daemon loads `pysandbox.policy.json`; a workspace override is honoured **only** if admin-signed, else rejected fail-closed to the shipped default. | HLD ADR-021. | Attacker-authorable policy. |
+| AS-17 | Redirects | The outbound HTTP client does **not** follow cross-origin redirects and never re-sends `Authorization` across hosts. | HLD ADR-007. | Token-leak vector reopens. |
+| AS-18 | Untrusted content | Each downstream response is returned to the guest as a typed `{ untrusted: true, contentType, body }` envelope; raw text is never auto-fed to the LLM; size-capped (default 1 MiB) with a truncation flag. | HLD ADR-008/ADR-017. | Prompt-injection surface widens. |
+| AS-19 | Audit | One append-only entry per outbound call (sizes, keyed-HMAC user id, `runId`, never tokens/bodies); SIEM/OTLP export mandatory in real-credential mode, checked fail-closed at startup; local `.jsonl` is non-authoritative. | HLD ADR-016. | Non-repudiation lost. |
+| AS-20 | Supply chain | The RustPython WASM artefact + Wasmtime/crate tree are pinned + lockfiled + content-digested, verified before instantiation, never dynamically/remotely loaded; `cargo audit`/`cargo deny` gate CI; the service installer is signed. | HLD ADR-018/ADR-022. | Tampered runtime collapses the boundary. |
+| AS-21 | Out-of-scope concerns | Pagination, CORS, and DB migrations do **not** apply (the guest handles pagination; no browser origin; no relational schema). | HLD 07. | Unneeded code if added. |
+| AS-22 | Pass-through resource audiencing | For a `Passthrough` capability the daemon **requests the capability's `audience` at sign-in** so the IdP issues an access token audienced for the resource server, which then validates it. Mechanism for the demo Dex: cross-client **trusted-peer** scope `audience:server:client_id:<resource-client-id>`; for generic IdPs the standards-track alternative is the **RFC 8707 `resource` indicator** (see OQ-G). The `audience` field already exists on `ResolvedCapability` (`phase-2-architecture.md:104`); this change only consumes it. | RFC 01; broker.rs:290-292; ADR-029. | If wrong, the issued token is not audienced for the resource and a validating server rejects it — pass-through breaks. |
+| AS-23 | Demo resource server is example infra | The validating resource server is **demo/example infrastructure** under `examples/demo/`, specified by RFC 01's acceptance criteria and built in the Playbook's demo step — **not** a `faradayd` product component, so it is not added to the Phase 2B inventory. | HLD: the demo is "not shipped, a dev convenience only" (docker-compose header). | If wrong, the faraday component spec set carries a non-product component. |
+| AS-24 | Minimal faradayd surface | `faradayd` already **forwards** the access token in pass-through (C10/C11); the only product-code change is (a) C13 collecting the run's distinct capability audiences and (b) C8 including them in the authorize/token request. No new shared type, no new env var. | RFC 01 scope (Option A); `phase-2-architecture.md:104`. | If wrong, scope expands beyond C8/C13 (e.g. a new config var or shared type). |
+
+## 1B — Open Questions
+
+Only decisions that **block** authoring are listed. **None block.** Carried from HLD `10-risks` and the daemon proposal:
+
+| ID | Question | Options | Impact | Blocking? |
+|---|---|---|---|---|
+| OQ-A | Client-auth strength: is peer-UID + connection token sufficient, or is first-connect consent mandatory for every new client identity? | token-only / token + mandatory first-connect consent | Stronger client gating vs friction; settled by the security review (the SR-24 pen test). | No |
+| OQ-B | Daemon activation: always-on per-user service vs socket-activated on first connect. | always-on / socket-activated | Startup latency vs idle footprint. | No |
+| OQ-C | Consent-UI mechanism: a daemon-served local `127.0.0.1` page, a native dialog/tray, or both per interaction type. | browser page / native dialog / both | UX + dependency surface; OIDC sign-in needs a browser regardless. | No |
+| OQ-D | Multi-client interaction routing: when two clients are connected, which renders a daemon-initiated prompt? | originating client only / broadcast | Proposed default: the originating client only, never broadcast. | No |
+| OQ-E | Windows named-pipe peer authentication: confirm `GetNamedPipeClientProcessId` + token-check gives an equivalent peer-UID guarantee to UDS `SO_PEERCRED`. | **RESOLVED (ADR-030):** named pipe + per-user-SID DACL + `GetNamedPipeClientProcessId`→token-SID equality (the analogue of UID-equality); on the SR-24 client-auth pen-test scope. | Affects the Windows client-auth implementation only. | No (resolved) |
+| OQ-F | MCP elicitation availability across target IDE clients for `interaction_required` delegation. | available / fall back to daemon UI | Where absent, the daemon-owned UI is used — no contract change. | No |
+| OQ-G | Audience-request mechanism for pass-through resource audiencing (AS-22). | Dex cross-client trusted-peer scope `audience:server:client_id:<peer>` / RFC 8707 `resource` indicator | Proposed default: Dex cross-client for the demo (Dex supports it), with RFC 8707 named as the generic-IdP path. Affects C8's authorize request and the demo Dex/IdP config; no faraday contract change. | No |
+
+## 1C — Glossary
+
+| Term | Definition | Example |
+|---|---|---|
+| Daemon (`faradayd`) | The per-user, host-resident Rust binary hosting all components; agent hosts connect over the local socket. | One `faradayd` per OS user, run by the service manager. |
+| Client | A thin agent host connecting via the single `run` entry; holds no tokens, renders no UI by requirement. | An MCP-capable IDE (config only), a CLI, a harness. |
+| Connection token | A per-launch 128-bit CSPRNG secret a client must present to open the control socket (with peer-UID). | 128-bit token in a `0600` runtime file. |
+| Control endpoint | The daemon's local socket exposing the `run` entry over native RPC + a single MCP tool. | UDS `0600` / named pipe. |
+| Session | A `(clientId, workspaceId)`-keyed span over which consent decisions and the per-session budget apply. | One workspace context per connected client. |
+| `run` entry | The single agent-facing operation: submit code + capabilities, stream results (or a dry-run plan). | `run({code, requestedCapabilities, dryRun})`. |
+| `interaction_required` | A typed daemon→client challenge (`sign_in`/`consent`/`step_up`) satisfied by the daemon-owned UI (or elicitation/CLI). | `step_up` carrying RFC 9470 `acr_values`/`max_age`. |
+| Consent/Auth UI | The daemon-owned surface that renders sign-in, consent, and step-up. | A local `127.0.0.1` page / native dialog. |
+| Capability handle (`capId`) | An opaque 128-bit per-run token naming a capability; not a credential; bound to the daemon instance. | `capId=ab12…`, valid ≤5 min. |
+| Capability manifest | `pysandbox.policy.json` — the provider/host/path/method allowlist; admin-signed overrides only. | Shipped default + signed workspace override. |
+| `pysandbox_sdk` | The injected Python module — the only egress path, backed by the single WASM host import. | `api.tickets.get("/api/v2/tickets/42")`. |
+| Identity Broker | The daemon module holding all tokens and performing all outbound HTTPS; the single source of truth for credentials. | Holds the IdP-issued token; the guest never sees it. |
+| Sandbox Runtime | The Wasmtime + RustPython component running guest code with no ambient authority. | Forwards the guest's one host import to the broker. |
+| Untrusted-content envelope | The typed `{ untrusted, contentType, body }` wrapper for every downstream response (ADR-017). | Returned to the guest's code, not auto-fed to the LLM. |
+| `obo-broker` | The committed backend confidential-client service performing RFC 8693 token exchange off-workstation. | `POST /v1/exchange` with the user `id_token`. |
+| Resource audience | The identifier the IdP stamps into an access token's `aud` to name the service the token is *for*; a pass-through resource server accepts only tokens carrying its own audience. | `aud: "demo-resource"` on a Dex-issued access token. |
+| Trusted peer (Dex) / resource indicator (RFC 8707) | The two mechanisms by which a client asks the IdP to audience a token for another resource: Dex's cross-client trusted-peer `audience:server:client_id:<peer>` scope, or the standards-track `resource` request parameter. | Dex `trustedPeers: [faradayd]` on the resource client. |

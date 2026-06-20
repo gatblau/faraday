@@ -1,0 +1,6 @@
+[toolchain]
+# Pins the toolchain IntelliJ's Rust plugin / rustup will use for this crate.
+channel = "stable"
+components = ["clippy", "rustfmt", "rust-src"]
+# wasm32 target for the RustPython guest artefact (docs/design/sandbox-daemon ADR-013/014).
+targets = ["wasm32-wasip1"]

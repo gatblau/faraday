@@ -1,0 +1,50 @@
+#!/bin/bash
+# faradayd macOS package postinstall (ADR-030/ADR-031).
+# Runs as root during install. Installs the per-user launchd agent for the console user,
+# registers the MCP front door in their Claude Code config (merge, no clobber), and loads
+# the agent. Best-effort: a failure here must not fail the package install.
+set -u
+
+BIN="/usr/local/bin/faradayd"
+LABEL="dev.faraday.faradayd"
+
+CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
+  echo "faradayd: no console user; skipping per-user setup (run 'faradayd install-mcp-config' after login)"
+  exit 0
+fi
+UID_NUM="$(id -u "$CONSOLE_USER")"
+HOME_DIR="$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+[ -z "$HOME_DIR" ] && HOME_DIR="/Users/$CONSOLE_USER"
+AGENTS="$HOME_DIR/Library/LaunchAgents"
+LOGDIR="$HOME_DIR/Library/Logs"
+PLIST="$AGENTS/$LABEL.plist"
+
+mkdir -p "$AGENTS" "$LOGDIR"
+cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$BIN</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>$LOGDIR/faradayd.out.log</string>
+  <key>StandardErrorPath</key><string>$LOGDIR/faradayd.err.log</string>
+</dict>
+</plist>
+PLIST
+chown "$CONSOLE_USER" "$PLIST"
+
+# Register the MCP front door in the user's Claude Code config (idempotent, no clobber).
+sudo -u "$CONSOLE_USER" "$BIN" install-mcp-config "$HOME_DIR/.claude.json" || \
+  echo "faradayd: MCP config merge skipped (run 'faradayd install-mcp-config' manually)"
+
+# Load the agent for the live GUI session (best-effort across macOS versions).
+launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>/dev/null || \
+  sudo -u "$CONSOLE_USER" launchctl load "$PLIST" 2>/dev/null || \
+  echo "faradayd: agent will start at next login"
+
+exit 0

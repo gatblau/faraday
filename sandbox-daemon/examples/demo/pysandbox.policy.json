@@ -1,0 +1,18 @@
+{
+  "capabilities": {
+    "dummy": {
+      "provider": "dummy",
+      "authMode": "passthrough",
+      "host": "127.0.0.1:8080",
+      "pathAllow": ["^/json$", "^/anything(/.*)?$", "^/get$"],
+      "methods": ["GET", "POST"],
+      "allowWrite": true
+    },
+    "catfacts": {
+      "authMode": "none",
+      "host": "catfact.ninja",
+      "pathAllow": ["^/fact$"],
+      "methods": ["GET"]
+    }
+  }
+}

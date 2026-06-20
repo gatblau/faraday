@@ -1,0 +1,236 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://faraday.dev/schemas/pysandbox.policy.schema.json",
+  "title": "PySandbox Policy Manifest",
+  "description": "Authoritative capability manifest (`pysandbox.policy.json`) for the pysandbox-agent VS Code extension and its companion obo-broker service. Governs which pre-approved external API operations agent-authored Python may invoke through the Identity Broker. The capabilities map IS the authorisation taxonomy: each entry names a provider plugin plus the host/path/method allowlist the broker enforces. Derived from docs/design/sandbox and docs/design/obo-broker (revision 0.6.1); supersedes the pre-pivot schema in the retired design.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["capabilities", "defaults"],
+  "properties": {
+    "capabilities": {
+      "type": "object",
+      "description": "Map of capability id -> capability definition. The id is the value referenced in run().requestedCapabilities and is the stable taxonomy key.",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[a-z0-9]+(\\.[a-z0-9]+)*$",
+        "description": "Dotted lowercase capability id, e.g. github.repo.read or internal.tickets."
+      },
+      "additionalProperties": { "$ref": "#/$defs/capability" }
+    },
+    "defaults": { "$ref": "#/$defs/defaults" },
+    "siemExport": { "$ref": "#/$defs/siemExport" }
+  },
+  "$defs": {
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "pathAllow", "methods"],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "description": "providerId of an in-tree, security-reviewed Provider Plugin (obo-broker ADR-009/ADR-017). The provider is selected per capability by the Provider Registry. Provider plugins are pluggable and compiled in — never dynamically loaded; there is no default provider. The reference baseline is 'rfc8693' (generic RFC 8693 token exchange against the configured IdP — Okta, Keycloak, Entra's standards endpoint, or any RFC 8693 authorization server; requires `audience`). Peer in-tree plugins extend this set for non-standard cases (e.g. 'github' OAuth, an 'entra' OBO-dialect plugin, or a header-injection access-gateway variant such as 'okta-access-gateway'). An unknown provider fails closed at load.",
+          "examples": ["rfc8693", "github"]
+        },
+        "scopes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "Advisory only: the issued token may carry broader scopes than listed, and per-call downscoping is not generally available. host + pathAllow + methods are the ENFORCED controls. Do not rely on scopes as a security boundary."
+        },
+        "host": {
+          "type": "string",
+          "format": "hostname",
+          "description": "Exactly one allowlisted host. The broker pins outbound calls to this host, does not auto-follow cross-origin redirects, and never re-sends Authorization across a host boundary. Wildcards are not permitted — one host per capability."
+        },
+        "audience": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Downstream API audience for the on-behalf-of / token-exchange flow. REQUIRED for token-exchange providers (provider=rfc8693 and equivalents); omit for non-exchange providers such as github. The broker additionally validates this rule per-provider at load, because the pluggable provider set cannot be fully enumerated in the schema."
+        },
+        "pathAllow": {
+          "type": "array",
+          "items": { "type": "string", "format": "regex", "minLength": 1 },
+          "minItems": 1,
+          "description": "Anchored regexes matched against the CANONICALISED path (URL-decoded; '.' and '..' resolved; duplicate slashes collapsed), excluding the query string. A path still containing '..' after canonicalisation is rejected before matching. Anchor every pattern (^...$ or ^.../.*) — an unanchored pattern is a privilege-escalation hazard."
+        },
+        "methods": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["GET", "POST", "PATCH", "PUT", "DELETE"] },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "HTTP methods the broker permits for this capability. The pysandbox_sdk currently exposes get/post/patch/delete; PUT is accepted in policy for forward compatibility."
+        },
+        "requireStepUpAuth": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, this capability requires step-up authentication: the broker (obo-broker ADR-014) demands an id_token whose `acr` claim is in the configured allowlist and otherwise returns an RFC 9470 401 challenge; the extension performs an IdP step-up and retries once (ADR-015). The step-up signal is never caller-supplied. Recommended true for write capabilities (POST/PATCH/PUT/DELETE on sensitive hosts)."
+        },
+        "authMode": {
+          "type": "string",
+          "enum": ["exchange", "passthrough", "none", "api_key"],
+          "default": "exchange",
+          "description": "How the broker authenticates the downstream call. `exchange` (default) routes via the obo-broker token exchange; `passthrough` forwards the user's OIDC access token (admin-signed only); `none` sends no credential (server-mode public endpoint, ADR-037); `api_key` applies a per-capability static key (ADR-036, requires secretRef + keyPlacement). `none` and `api_key` need no provider/audience/scopes."
+        },
+        "allowWrite": {
+          "type": "boolean",
+          "default": false,
+          "description": "Server-mode write gate (ADR-039): a capability is read-only (GET only) unless this is true; honoured only in an administrator-signed manifest. An unsafe method (POST/PUT/PATCH/DELETE) without allowWrite is rejected fail-closed at load (CFG_INVALID)."
+        },
+        "secretRef": {
+          "type": "string",
+          "minLength": 1,
+          "description": "api_key mode (ADR-036): the SecretResolver reference for this capability's key — a file path under FileSecretResolver. Required for authMode=api_key; forbidden otherwise. The key file is read once at startup, never logged, never returned to the guest."
+        },
+        "keyPlacement": {
+          "description": "api_key mode (ADR-036): how the resolved key is attached to the outbound request. Required for authMode=api_key; forbidden otherwise.",
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["header"],
+              "properties": {
+                "header": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["name"],
+                  "properties": {
+                    "name": { "type": "string", "minLength": 1 },
+                    "scheme": { "type": "string", "minLength": 1 }
+                  }
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["query"],
+              "properties": {
+                "query": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["param"],
+                  "properties": {
+                    "param": { "type": "string", "minLength": 1 }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "$comment": "Token-exchange providers require an audience. One clause per token-exchange provider; extend as plugins are added.",
+          "if": {
+            "properties": { "provider": { "const": "rfc8693" } },
+            "required": ["provider"]
+          },
+          "then": { "required": ["audience"] }
+        },
+        {
+          "$comment": "provider + scopes are required for exchange/passthrough only; `none` (ADR-037) and `api_key` (ADR-036) need neither. Absent authMode defaults to `exchange`.",
+          "if": {
+            "properties": { "authMode": { "enum": ["none", "api_key"] } },
+            "required": ["authMode"]
+          },
+          "then": {},
+          "else": { "required": ["provider", "scopes"] }
+        },
+        {
+          "$comment": "Step-up is not applicable to a non-OIDC capability (ADR-039).",
+          "if": {
+            "properties": { "authMode": { "enum": ["none", "api_key"] } },
+            "required": ["authMode"]
+          },
+          "then": { "properties": { "requireStepUpAuth": { "const": false } } }
+        },
+        {
+          "$comment": "Write gate (ADR-039): without allowWrite=true, only the safe method GET is permitted.",
+          "if": {
+            "not": {
+              "properties": { "allowWrite": { "const": true } },
+              "required": ["allowWrite"]
+            }
+          },
+          "then": { "properties": { "methods": { "items": { "const": "GET" } } } }
+        },
+        {
+          "$comment": "api_key requires secretRef + keyPlacement (ADR-036).",
+          "if": {
+            "properties": { "authMode": { "const": "api_key" } },
+            "required": ["authMode"]
+          },
+          "then": { "required": ["secretRef", "keyPlacement"] }
+        },
+        {
+          "$comment": "secretRef/keyPlacement are forbidden unless authMode is api_key (ADR-036).",
+          "if": {
+            "not": {
+              "properties": { "authMode": { "const": "api_key" } },
+              "required": ["authMode"]
+            }
+          },
+          "then": {
+            "properties": { "secretRef": false, "keyPlacement": false }
+          }
+        }
+      ]
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requireUserConsentPerSession", "maxCallsPerRun", "maxCallsPerSession", "responseMaxBytes"],
+      "properties": {
+        "requireUserConsentPerSession": {
+          "type": "boolean",
+          "description": "When true, first use of each capability in a workspace session prompts the user for consent (cached in memory, not persisted)."
+        },
+        "maxCallsPerRun": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Hard cap on outbound broker calls within a single run. Over-budget calls return a 429-shaped error."
+        },
+        "maxCallsPerSession": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Hard cap on outbound broker calls across all runs in a workspace session. MUST be >= maxCallsPerRun (enforced by the broker at load, not by the schema)."
+        },
+        "responseMaxBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum response body size returned to the guest; larger responses are truncated with a flag."
+        },
+        "debug": {
+          "type": "boolean",
+          "default": false,
+          "description": "Developer mode: when true, request/response bodies may be logged. MUST be false in enterprise policy (the broker rejects debug=true under real-credential mode)."
+        }
+      }
+    },
+    "siemExport": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Audit export configuration (obo-broker ADR-016). When the deployment uses real (non-mock) credentials, a reachable tamper-evident sink is REQUIRED and checked fail-closed at startup; with no reachable sink the deployment runs mock / non-sensitive-credentials-only. The exported stream is the authoritative audit record; the local .jsonl log is non-authoritative. NOTE: the precise field set is a documented assumption pending /spec confirmation.",
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether audit entries are exported to a SIEM/OTLP sink."
+        },
+        "otlpEndpoint": {
+          "type": "string",
+          "format": "uri",
+          "description": "OTLP endpoint URL for the audit export. Required (and must be reachable) when enabled is true and the deployment uses real credentials."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
+          "then": { "required": ["otlpEndpoint"] }
+        }
+      ]
+    }
+  }
+}

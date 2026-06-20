@@ -1,0 +1,27 @@
+# pysandbox-guest — the RustPython wasm32-wasip1 guest (C12 / build-plan Phase 7).
+# Built separately for the wasm32-wasip1 target; its sha256 is pinned in
+# ../CHECKSUMS.txt and verified by the SandboxRuntime before instantiation (ADR-018).
+# `[workspace]` makes this its own root so it does not inherit the daemon package.
+[workspace]
+
+[package]
+name = "pysandbox-guest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "pysandbox-guest"
+path = "src/main.rs"
+
+[dependencies]
+rustpython-vm = { version = "0.5", default-features = false, features = ["compiler", "stdio", "gc", "freeze-stdlib"] }
+# The actual Python stdlib bytes (the `freeze-stdlib` feature on rustpython-vm only
+# switches the bootstrap to expect frozen modules; the bytes live here) and the native
+# (Rust-implemented) accelerator modules the pure-Python stdlib imports.
+rustpython-pylib = { version = "0.5", features = ["freeze-stdlib"] }
+rustpython-stdlib = { version = "0.5", default-features = false }
+
+[profile.release]
+opt-level = "s"
+strip = true

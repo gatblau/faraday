@@ -1,0 +1,15 @@
+*.iml
+.idea
+.claude/
+docs/wip
+CLAUDE.md
+
+# Build output (polyglot: TypeScript / Rust / Go)
+node_modules/
+dist/
+out/
+target/
+*.vsix
+
+# Coverage report output (cargo-llvm-cov)
+lcov.info

@@ -1,0 +1,28 @@
+# Dex config for the local demo. A PUBLIC (PKCE) client matching ADR-029 — no client
+# secret on the workstation — and a static test user. The loopback redirect uses an
+# ephemeral 127.0.0.1 port. Per RFC 8252, Dex accepts any loopback port for a public
+# client ONLY when no redirectURIs are registered (registering any switches matching to
+# exact-string). The 127.0.0.1 loopback exemption (not just "localhost") requires Dex
+# >= v2.42.0 — see docker-compose.yml. Hence: public client, deliberately NO redirectURIs.
+issuer: http://127.0.0.1:5556/dex
+storage:
+  type: memory
+web:
+  http: 0.0.0.0:5556
+enablePasswordDB: true
+oauth2:
+  passwordConnector: local
+  skipApprovalScreen: true
+staticPasswords:
+  # bcrypt("password"); test-only fixture for the ephemeral demo Dex, not a secret.
+  - email: "test@example.com"
+    hash: "$2y$10$N/3FzpIqyUXPz0mTY0k6NO0R7TMcPWUkRgp/Zt1UEVbKynGlqUjTW"
+    username: "test"
+    userID: "08a8684b-db88-4b73-90a9-3cd1661f5466"
+staticClients:
+  - id: faradayd
+    name: faradayd
+    public: true
+    # No redirectURIs on purpose: an empty list is what enables Dex's RFC 8252
+    # any-port loopback exemption for public clients. Registering any URI here would
+    # force exact-string matching and reject the daemon's ephemeral 127.0.0.1:<port>.
