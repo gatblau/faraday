@@ -357,7 +357,10 @@ mod server_mode_tests {
             matches!(c.auth_mode, AuthMode::Unauthenticated),
             "catfacts must be authMode none so the example needs no sign-in"
         );
-        assert_eq!(c.host, "catfact.ninja", "real public host the example documents");
+        assert_eq!(
+            c.host, "catfact.ninja",
+            "real public host the example documents"
+        );
         assert_eq!(c.methods, vec!["GET".to_string()], "GET only");
         assert!(!c.allow_write, "read-only capability");
         assert!(!c.require_step_up, "no step-up on a none capability");
