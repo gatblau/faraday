@@ -22,20 +22,52 @@ jobs:
         with: { name: coverage-lcov, path: sandbox-daemon/lcov.info }
 
   build-windows:
-    # windows-deployment phase 2: prove the Tier-1 compile-blockers are gone — faradayd
-    # and faradayd-ipc compile and link on Windows with the named-pipe transport stubbed,
-    # and the Docker-free unit tests pass (including the stub's Unsupported assertions).
-    # The Dex/mock-REST integration suite stays on ubuntu (it needs Linux containers,
-    # RISK-001); coverage parity, clippy, and the arch matrix are added in phase 4.
+    # windows-deployment phase 4: parity with the Unix gate. An arch matrix builds the
+    # workspace (x86_64 native + aarch64 cross), the native target runs clippy + the
+    # Docker-free unit and named-pipe integration tests under coverage, and a >=70%
+    # line-coverage gate is enforced on the faradayd-ipc transport/auth crate (the
+    # Windows-specific modules). The Dex/mock-REST integration suite stays on ubuntu
+    # (Linux containers, RISK-001).
+    runs-on: windows-latest
+    defaults: { run: { working-directory: sandbox-daemon } }
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "clippy,llvm-tools-preview", targets: "${{ matrix.target }}" }
+      # aarch64 cannot run on the x86_64 runner: build the Windows-specific crate for it
+      # (the daemon's heavy deps — wasmtime — are not cross-built for aarch64 here; FU-009).
+      - if: matrix.target == 'aarch64-pc-windows-msvc'
+        run: cargo build -p faradayd-ipc --all-targets --target ${{ matrix.target }}
+      # x86_64 is native: full workspace build + clippy + the coverage-gated test run.
+      - if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo build --workspace --all-targets --target ${{ matrix.target }}
+      - if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+      - if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: taiki-e/install-action@cargo-llvm-cov
+      # Coverage gate on the Windows transport/auth crate (playbook Step 0, >=70% lines).
+      - if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo llvm-cov -p faradayd-ipc --target ${{ matrix.target }} --fail-under-lines 70 --summary-only
+
+  windows-pentest:
+    # ADR-024 peer-auth pen test (spec G3): a different local user must be refused by the
+    # §5 DACL; the job exits non-zero on any default-allow open. Falls back to the §8
+    # anonymous/name-squatting integration tests (build-windows) where a hosted runner will
+    # not let us create / log on as a second account (RISK-003).
+    needs: build-windows
     runs-on: windows-latest
     defaults: { run: { working-directory: sandbox-daemon } }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # --workspace so the faradayd-ipc member (incl. its #[cfg(windows)] stub tests that
-      # assert bind/connect return Unsupported) is built and run, not just the daemon crate.
-      - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace
+      - run: cargo build -p faradayd-ipc --examples
+      - name: ADR-024 peer-auth pen test
+        shell: pwsh
+        run: ./ci/windows-pentest.ps1
 
   security:
     # Dependency-advisory, licence, ban, and source gate (cargo-deny, ADR-018).
@@ -45,3 +77,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with: { manifest-path: sandbox-daemon/Cargo.toml, command: check }
+      # ADR-018: also audit the Windows-only dependency tree (the `windows` crate et al.),
+      # which the host-target check above does not see.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: sandbox-daemon/Cargo.toml
+          command: check
+          arguments: --target x86_64-pc-windows-msvc

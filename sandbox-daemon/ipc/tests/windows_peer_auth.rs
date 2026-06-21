@@ -30,10 +30,15 @@ async fn happy_path_same_user_yields_the_daemon_principal() {
     let listener = Listener::bind(&pipe, token.to_str().unwrap()).expect("bind");
     let daemon = listener.daemon_principal().clone();
 
+    // The client connects and sends one framed message, exercising the named-pipe framing.
     let pipe2 = pipe.clone();
-    let client = tokio::spawn(async move { connect(&pipe2).await });
-    let (_conn, principal) = listener.accept().await.expect("accept");
-    client.await.unwrap().expect("client connects");
+    let client = tokio::spawn(async move {
+        let mut c = connect(&pipe2).await.expect("client connects");
+        c.write_frame(b"ping").await.expect("client writes a frame");
+        c
+    });
+    let (mut conn, principal) = listener.accept().await.expect("accept");
+    let _client = client.await.unwrap();
 
     // The test client runs as the same Windows user as the daemon, so the impersonated SID
     // equals the daemon's own user SID (canonical string form).
@@ -41,10 +46,17 @@ async fn happy_path_same_user_yields_the_daemon_principal() {
         principal, daemon,
         "same-user client must map to the daemon principal"
     );
-    match principal {
+    match &principal {
         PeerPrincipal::Windows(sid) => assert!(sid.starts_with("S-1-"), "canonical SID: {sid}"),
         other => panic!("expected a Windows principal, got {other:?}"),
     }
+
+    // Round-trip the framed message over the named pipe (server-side read).
+    let frame = conn.read_frame().await.expect("read").expect("a frame");
+    assert_eq!(
+        frame, b"ping",
+        "the framed payload survives the named-pipe transport"
+    );
 }
 
 // §8.3 — A client that hides its identity (SECURITY_ANONYMOUS) cannot be resolved to a SID,
