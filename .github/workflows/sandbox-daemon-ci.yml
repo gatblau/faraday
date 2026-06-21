@@ -81,7 +81,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --bin faradayd
-      - run: dotnet tool install --global wix
+      # Pin WiX 5: WiX 6/7 gate behind the Open Source Maintenance Fee EULA (WIX7015);
+      # v5 is the last EULA-free line and uses the same v4 schema namespace as faradayd.wxs.
+      - run: dotnet tool install --global wix --version 5.0.2
       - name: Build the .msi
         shell: pwsh
         run: ./packaging/windows/build-msi.ps1
