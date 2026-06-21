@@ -4,9 +4,11 @@
 use std::collections::HashSet;
 
 /// The authenticated connecting peer (server-derived, never client-asserted) — C6.
+/// `principal` is the opaque, platform-neutral peer identity (decimal UID on Unix,
+/// string SID on Windows); see `clientauth::PeerPrincipal`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClientIdentity {
-    pub peer_uid: u32,
+    pub principal: String,
     pub client_label: String,
 }
 

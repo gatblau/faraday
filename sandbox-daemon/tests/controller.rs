@@ -182,7 +182,7 @@ fn harness(budget: u32, consent: bool, body: &[u8]) -> Harness {
 fn session() -> SessionHandle {
     SessionHandle {
         client: ClientIdentity {
-            peer_uid: 501,
+            principal: "501".into(),
             client_label: "vscode".into(),
         },
         workspace_id: "ws".into(),

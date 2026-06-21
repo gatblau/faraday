@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use faradayd::audit::{AuditLogger, AuditSink};
-use faradayd::clientauth::ClientAuth;
+use faradayd::clientauth::{ClientAuth, PeerPrincipal};
 use faradayd::policy::PolicyEngine;
 use faradayd::sanitize;
 use faradayd::session::SessionManager;
@@ -18,7 +18,7 @@ const MANIFEST: &str = r#"{"capabilities":{"internal.tickets":{
 fn session(calls_used: u32) -> Session {
     Session {
         client: ClientIdentity {
-            peer_uid: 0,
+            principal: "0".into(),
             client_label: "t".into(),
         },
         workspace_id: "w".into(),
@@ -156,7 +156,7 @@ fn c3_emits_hmac_id_not_raw_subject() {
 fn c7_consent_cached_and_sessions_isolated_and_budgeted() {
     let sm = SessionManager::new(2);
     let c = ClientIdentity {
-        peer_uid: 501,
+        principal: "501".into(),
         client_label: "vscode".into(),
     };
 
@@ -185,34 +185,49 @@ async fn c6_authenticates_over_real_uds_and_rejects() {
     let (server, _) = listener.accept().await.unwrap();
     let peer_uid = server.peer_cred().unwrap().uid();
 
-    let auth = ClientAuth::new(peer_uid, b"the-token".to_vec());
+    let auth = ClientAuth::new(PeerPrincipal::Unix(peer_uid), b"the-token".to_vec());
 
     // happy: same UID + correct token + first-connect consent granted
     let id = auth
-        .authenticate(peer_uid, b"the-token", "vscode", &|_| true)
+        .authenticate(
+            PeerPrincipal::Unix(peer_uid),
+            b"the-token",
+            "vscode",
+            &|_| true,
+        )
         .unwrap();
-    assert_eq!(id.peer_uid, peer_uid);
+    assert_eq!(id.principal, peer_uid.to_string());
     assert_eq!(id.client_label, "vscode");
 
     // wrong token
     assert_eq!(
-        auth.authenticate(peer_uid, b"wrong", "vscode", &|_| true)
+        auth.authenticate(PeerPrincipal::Unix(peer_uid), b"wrong", "vscode", &|_| true)
             .unwrap_err()
             .code,
         "CLIENT_TOKEN_DENIED"
     );
     // different UID
     assert_eq!(
-        auth.authenticate(peer_uid + 1, b"the-token", "vscode", &|_| true)
-            .unwrap_err()
-            .code,
+        auth.authenticate(
+            PeerPrincipal::Unix(peer_uid + 1),
+            b"the-token",
+            "vscode",
+            &|_| true
+        )
+        .unwrap_err()
+        .code,
         "CLIENT_UID_DENIED"
     );
     // a new client identity that declines consent
     assert_eq!(
-        auth.authenticate(peer_uid, b"the-token", "unapproved", &|_| false)
-            .unwrap_err()
-            .code,
+        auth.authenticate(
+            PeerPrincipal::Unix(peer_uid),
+            b"the-token",
+            "unapproved",
+            &|_| false
+        )
+        .unwrap_err()
+        .code,
         "CLIENT_NOT_APPROVED"
     );
 

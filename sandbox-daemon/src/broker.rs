@@ -274,7 +274,7 @@ impl IdentityBroker {
         // here; the returned canonical path is what we actually call.
         let throwaway = Session {
             client: ClientIdentity {
-                peer_uid: 0,
+                principal: "0".to_string(),
                 client_label: String::new(),
             },
             workspace_id: String::new(),

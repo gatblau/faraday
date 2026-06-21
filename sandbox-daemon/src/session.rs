@@ -6,7 +6,7 @@ use crate::types::{ClientIdentity, Session};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-type Key = (u32, String, String);
+type Key = (String, String, String);
 
 pub struct SessionManager {
     max_per_session: u32,
@@ -23,7 +23,7 @@ impl SessionManager {
 
     fn key(client: &ClientIdentity, workspace: &str) -> Key {
         (
-            client.peer_uid,
+            client.principal.clone(),
             client.client_label.clone(),
             workspace.to_string(),
         )

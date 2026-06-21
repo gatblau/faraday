@@ -161,7 +161,7 @@ async fn c8_validates_real_dex_token_headless_and_consent() {
 
     let id_token = password_grant(&http).await;
     let who = ClientIdentity {
-        peer_uid: 501,
+        principal: "501".into(),
         client_label: "vscode".into(),
     };
 

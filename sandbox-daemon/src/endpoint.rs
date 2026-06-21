@@ -9,7 +9,7 @@ use crate::config::Config;
 #[cfg(unix)]
 mod unix_impl {
     use super::Config;
-    use crate::clientauth::ClientAuth;
+    use crate::clientauth::{ClientAuth, PeerPrincipal};
     use crate::controller::{RunOutcome, SandboxController};
     use crate::health::HealthCheck;
     use crate::types::{ClientIdentity, RunRequest, SessionHandle};
@@ -237,8 +237,16 @@ mod unix_impl {
                         .and_then(|x| x.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let auth = ClientAuth::new(inner.expected_uid, inner.token.as_bytes().to_vec());
-                    match auth.authenticate(peer_uid, token.as_bytes(), label, &|_| true) {
+                    let auth = ClientAuth::new(
+                        PeerPrincipal::Unix(inner.expected_uid),
+                        inner.token.as_bytes().to_vec(),
+                    );
+                    match auth.authenticate(
+                        PeerPrincipal::Unix(peer_uid),
+                        token.as_bytes(),
+                        label,
+                        &|_| true,
+                    ) {
                         Ok(id) => {
                             authed = Some(id);
                             write_json(&mut stream, &serde_json::json!({ "type": "connected" }))
