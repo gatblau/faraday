@@ -174,7 +174,10 @@ fn confirm_via_dialog(summary: &ConsentSummary) -> Option<bool> {
 /// into the MCP client config (default `$HOME/.claude.json`), preserving other servers.
 fn run_install_mcp_config() -> i32 {
     let config_path = std::env::args().nth(2).unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        // %USERPROFILE% on Windows where HOME is usually unset; HOME on Unix.
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
         format!("{home}/.claude.json")
     });
     let binary = std::env::current_exe()

@@ -26,10 +26,26 @@ fn daemon_paths() -> (String, String) {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
+    // Mirror config.rs so the front door and the daemon agree on the transport address and
+    // the per-user token path (Unix-domain socket on Unix; named pipe + %LOCALAPPDATA% on
+    // Windows — windows-deployment phase 3).
+    #[cfg(not(windows))]
     let socket =
         std::env::var("PYS_SOCKET_PATH").unwrap_or_else(|_| format!("{runtime_dir}/faradayd.sock"));
+    #[cfg(not(windows))]
     let token = std::env::var("PYS_CONNECTION_TOKEN_PATH")
         .unwrap_or_else(|_| format!("{runtime_dir}/faradayd.token"));
+    #[cfg(windows)]
+    let socket =
+        std::env::var("PYS_SOCKET_PATH").unwrap_or_else(|_| r"\\.\pipe\faradayd".to_string());
+    #[cfg(windows)]
+    let token = std::env::var("PYS_CONNECTION_TOKEN_PATH").unwrap_or_else(|_| {
+        let base = std::env::var("LOCALAPPDATA")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| runtime_dir.clone());
+        format!(r"{base}\faradayd\faradayd.token")
+    });
     (socket, token)
 }
 

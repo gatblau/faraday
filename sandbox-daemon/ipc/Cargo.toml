@@ -17,5 +17,17 @@ tokio = { version = "1", features = ["net", "io-util"] }
 # on Windows — one cross-platform source replacing the two /dev/urandom copies.
 getrandom = "0.2"
 
+# Win32 bindings for the Windows named-pipe transport + SID peer-auth (windows-peer-auth
+# §4/§5, ADR-024). Feature-gated to the exact symbol groups the impersonation sequence and
+# secure pipe creation need; nothing is pulled in off-Windows.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

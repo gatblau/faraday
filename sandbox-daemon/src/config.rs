@@ -91,10 +91,24 @@ impl Config {
     ) -> Result<Config, ConfigError> {
         let runtime_dir = opt(get, "XDG_RUNTIME_DIR")
             .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
+        // Unix: a Unix-domain socket + token file under the runtime dir.
+        #[cfg(not(windows))]
         let socket_path =
             opt(get, "PYS_SOCKET_PATH").unwrap_or_else(|| format!("{runtime_dir}/faradayd.sock"));
+        #[cfg(not(windows))]
         let token_path = opt(get, "PYS_CONNECTION_TOKEN_PATH")
             .unwrap_or_else(|| format!("{runtime_dir}/faradayd.token"));
+        // Windows (windows-deployment phase 3): the control transport is a named pipe, and
+        // the connection token lives under the per-user %LOCALAPPDATA% (per-user by its
+        // default ACLs). Falls back to the runtime dir if %LOCALAPPDATA% is unset.
+        #[cfg(windows)]
+        let socket_path =
+            opt(get, "PYS_SOCKET_PATH").unwrap_or_else(|| r"\\.\pipe\faradayd".to_string());
+        #[cfg(windows)]
+        let token_path = opt(get, "PYS_CONNECTION_TOKEN_PATH").unwrap_or_else(|| {
+            let base = opt(get, "LOCALAPPDATA").unwrap_or_else(|| runtime_dir.clone());
+            format!(r"{base}\faradayd\faradayd.token")
+        });
         let require_first_connect_consent =
             parse_bool(get, "PYS_REQUIRE_FIRST_CONNECT_CONSENT", true)?;
 
