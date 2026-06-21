@@ -37,7 +37,9 @@ impl PeerPrincipal {
 }
 
 /// The largest control frame accepted on the local transport (8 MiB), bounding the
-/// per-frame allocation a peer can force before authentication.
+/// per-frame allocation a peer can force before authentication. Used by the Unix
+/// transport; the Windows half is a stub that frames nothing until phase 3.
+#[cfg(unix)]
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 
 /// Mint a 128-bit CSPRNG connection token (hex). Uses the OS CSPRNG via `getrandom`
@@ -239,17 +241,24 @@ mod tests {
 
     // The Windows half is a stub until phase 3: bind and connect must fail closed so the
     // daemon never starts an unauthenticated transport on Windows.
+    // `.err().expect(...)` rather than `.unwrap_err()`: the Ok types (Listener/Connection)
+    // are transport handles with no Debug impl, and unwrap_err would require one.
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_bind_is_unsupported_until_phase_3() {
-        let err = Listener::bind(r"\\.\pipe\faradayd-test", "token.tmp").unwrap_err();
+        let err = Listener::bind(r"\\.\pipe\faradayd-test", "token.tmp")
+            .err()
+            .expect("bind must fail closed until phase 3");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_connect_is_unsupported_until_phase_3() {
-        let err = connect(r"\\.\pipe\faradayd-test").await.unwrap_err();
+        let err = connect(r"\\.\pipe\faradayd-test")
+            .await
+            .err()
+            .expect("connect must fail closed until phase 3");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 }
