@@ -91,7 +91,8 @@ pub struct Principal { pub subject: String, pub issuer: String, pub acr: Option<
 // Used by: IdentityBroker (C11), OboClient (C9), AuditLogger (C3).
 
 // ClientIdentity — the authenticated connecting peer (server-derived, never client-asserted).
-pub struct ClientIdentity { pub peer_uid: u32, pub client_label: String /* e.g. "vscode", "cli" */ }
+// `principal` is the opaque, platform-neutral peer identity: decimal UID on Unix, string SID on Windows.
+pub struct ClientIdentity { pub principal: String, pub client_label: String /* e.g. "vscode", "cli" */ }
 // Used by: ClientAuth (C6), SessionManager (C7).
 
 // Session — keyed by (client, workspace); holds consent cache + budgets in memory.

@@ -1,6 +1,6 @@
 # Component spec (draft) — Windows peer authentication for ClientAuth
 
-**Status:** Draft · **Owner component:** C6 ClientAuth (`src/clientauth.rs`) · **Transport dependency:** C8 control endpoint (`src/endpoint.rs`) · **derivedFromHld:** 0.4.1 · **(security-critical — ADR-024)**
+**Status:** Approved · **Owner component:** C6 ClientAuth (`src/clientauth.rs`) · **Transport:** C14 control endpoint via the `faradayd-ipc` seam (`ipc/src/lib.rs`) · **derivedFromHld:** 0.4.1 · **(security-critical — ADR-024)**
 
 This spec defines how `faradayd` authenticates a connecting client on **Windows**, where the
 Unix mechanism (peer UID via `SO_PEERCRED`) does not exist. It extends C6 ClientAuth; it does
@@ -51,10 +51,10 @@ the production and comparison of the principal differ by platform.
 Restated from C6, generalised from `peer_uid: u32` to `PeerPrincipal`:
 
 - `pub fn authenticate(&self, peer: PeerPrincipal, presented_token: &[u8], client_label: &str, first_connect_consent: &dyn Fn(&str) -> bool) -> Result<ClientIdentity, WireError>`
-- `pub fn mint_token() -> std::io::Result<String>` — 128-bit CSPRNG hex token. The Unix
-  implementation reads `/dev/urandom`; the Windows implementation must use a CSPRNG that does
-  not depend on `/dev/urandom` (the `getrandom` crate, which maps to `BCryptGenRandom` on
-  Windows, is the expected source). The token's format and length are unchanged.
+- `pub fn mint_token() -> std::io::Result<String>` — 128-bit CSPRNG hex token, owned by the
+  `faradayd-ipc` seam. It uses the `getrandom` crate on every platform (`/dev/urandom` family on
+  Unix, `BCryptGenRandom` on Windows), replacing the former hand-rolled `/dev/urandom` read. The
+  token's format and length are unchanged.
 
 `ClientAuth::new` takes the daemon's own `PeerPrincipal` in place of `daemon_uid: u32`.
 
@@ -186,36 +186,29 @@ Feature: Windows peer authentication
   (first-connect consent) of C6 are reused unchanged. Only principal derivation/comparison is
   new.
 
-## 10. Open questions
+## 10. Resolved decisions
 
-- **OQ-1 — `ClientIdentity.peer_uid` on Windows.** The shared type is
-  `ClientIdentity { peer_uid: u32, client_label }` (Phase-2C), and `peer_uid` feeds the session
-  key (`session.rs`). Windows has no `u32` UID. Because every accepted connection is, by the
-  §1 invariant, the *same* principal as the daemon, `peer_uid` carries no distinguishing
-  information for keying — `(client_label, workspace_id)` already does that.
-  **Recommended resolution:** widen `ClientIdentity` to carry an opaque
-  `principal: String` (decimal UID on Unix, string SID on Windows) and key sessions on it,
-  retiring the raw `peer_uid`. This is a Phase-2C shared-type change that also touches the Unix
-  path, so it needs sign-off rather than a silent assumption. A lower-touch alternative — keep
-  `peer_uid` and populate it with a per-launch constant on Windows — works because the field is
-  degenerate, but leaves a Unix-shaped field on a platform with no UID.
-- **OQ-2 — Spec↔code reconciliation.** C6's interface already names a `PeerCred` type, but
-  `clientauth.rs` currently passes `peer_uid: u32`. Introducing `PeerPrincipal` should be
-  reconciled with that existing `PeerCred` naming so the codebase has one principal type, not
-  two. Decision needed: adopt `PeerPrincipal`, or extend the existing `PeerCred`.
+- **OQ-1 — `ClientIdentity` keying on Windows — RESOLVED.** `ClientIdentity` carries an opaque
+  `principal: String` (decimal UID on Unix, string SID on Windows) and sessions key on
+  `(principal, client_label, workspace_id)`, retiring the raw `peer_uid`. The Phase-2C shared-type
+  change was applied across the Unix path too, behaviour-preserving — the Unix `principal` is the
+  decimal UID, a lossless re-encoding of the former integer key.
+- **OQ-2 — One principal type — RESOLVED.** The codebase adopts `PeerPrincipal`
+  (`enum { Unix(u32), Windows(String) }`, defined in the `faradayd-ipc` seam); the earlier
+  `PeerCred` naming is retired. `authenticate` takes `PeerPrincipal`; equality is integer
+  comparison on Unix and canonical-string-SID comparison on Windows (§6 pitfall 4).
 
 ## 11. Gaps
 
-- **G1 — Win32 binding not present.** No Windows API crate (`windows` / `winapi`) is in
-  `sandbox-daemon/Cargo.toml` today; the dependency must be added (and gated
-  `[target.'cfg(windows)'.dependencies]`) before this can be implemented. Until then the Win32
-  symbols in §4 are unresolved identifiers.
-- **G2 — Transport not implemented.** The Windows control transport is a stub today
-  (`endpoint.rs`: `#[cfg(not(unix))]` returns `Unsupported — "named-pipe transport is
-  implemented in a later phase"`). The §5 pipe-creation preconditions cannot be verified until
-  that transport exists; this spec assumes it lands first or alongside.
-- **G3 — Verification environment.** The behaviours in §8 (impersonation, SID comparison,
-  name-squatting) cannot be exercised on macOS or Linux. They require a real Windows host or a
-  `windows-latest` CI runner; the current CI is `ubuntu-latest` only. The dedicated peer-auth
-  pen test that ADR-024 relies on must be re-run on Windows — it is not covered by the existing
-  Unix test suite.
+All three gaps are closed by the windows-deployment implementation:
+
+- **G1 — Win32 binding — CLOSED.** The `windows` crate is a `[target.'cfg(windows)'.dependencies]`
+  of `faradayd-ipc` with the §9-A1 feature set; the §4 Win32 symbols resolve.
+- **G2 — Transport — CLOSED.** The Windows named-pipe transport is implemented in the
+  `faradayd-ipc` seam (`ipc/src/lib.rs`, `#[cfg(windows)]`): §5 secure pipe creation
+  (`FILE_FLAG_FIRST_PIPE_INSTANCE`, `PIPE_REJECT_REMOTE_CLIENTS`, an SDDL DACL granting only the
+  daemon SID) and the §4 impersonation principal derivation.
+- **G3 — Verification environment — CLOSED.** A `windows-latest` CI lane builds and runs the §8
+  Gherkin (same-user, anonymous, name-squatting) under a ≥70% coverage gate, plus the ADR-024
+  peer-auth pen test (`ci/windows-pentest.ps1`). The Dex/mock-REST integration suite stays on
+  `ubuntu-latest` (RISK-001).

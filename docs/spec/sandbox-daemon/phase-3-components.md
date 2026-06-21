@@ -199,30 +199,30 @@ Feature: ResponseSanitizer
 ### C6 ClientAuth
 **File:** `src/clientauth.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.1 · **(security-critical — ADR-024)**
 
-**Purpose.** Authenticate a connecting client: peer-UID equals the daemon's, the per-launch connection token matches, and (optionally) a new client identity passes first-connect consent. Mint/rotate the connection token at startup.
+**Purpose.** Authenticate a connecting client: the peer principal equals the daemon's, the per-launch connection token matches, and (optionally) a new client identity passes first-connect consent. The connection token is minted by the transport seam (`faradayd-ipc::mint_token`, a `getrandom` CSPRNG) and written `0600` by the control endpoint at startup; C6 no longer mints it.
 
 **Public Interface.**
-- `pub fn init_token(&self) -> Result<(), AuthError>` — generate a 128-bit CSPRNG token; write `0600` to `PYS_CONNECTION_TOKEN_PATH`.
-- `pub fn authenticate(&self, peer: PeerCred, presented_token: &[u8], client_label: &str) -> Result<ClientIdentity, AuthError>`
+- `pub fn new(daemon: PeerPrincipal, token: Vec<u8>) -> Self` — construct with the daemon's own principal and the live connection-token bytes.
+- `pub fn authenticate(&self, peer: PeerPrincipal, presented_token: &[u8], client_label: &str, first_connect_consent: &dyn Fn(&str) -> bool) -> Result<ClientIdentity, WireError>`
 
 **Internal Logic.**
-1. Read `peer.uid` via `SO_PEERCRED`/`getpeereid` (UDS) or `GetNamedPipeClientProcessId`+token (Windows); `uid != daemon uid` → `CLIENT_UID_DENIED`.
+1. Compare the server-derived `peer` to the daemon's own `PeerPrincipal`: integer UID equality on Unix (`SO_PEERCRED`/`getpeereid`); on Windows the impersonated client `TokenUser` SID compared with `EqualSid` (`ImpersonateNamedPipeClient`→`OpenThreadToken`→`TokenUser`→`RevertToSelf`, the SID canonicalised via `ConvertSidToStringSid` — never `GetNamedPipeClientProcessId`, which has a PID-reuse race; see `windows-peer-auth.md` §4/§6). A mismatch, or a principal that cannot be determined, → `CLIENT_UID_DENIED`.
 2. Constant-time compare `presented_token` to the live connection token; mismatch → `CLIENT_TOKEN_DENIED`.
-3. If `PYS_REQUIRE_FIRST_CONNECT_CONSENT` and `client_label` is unseen this launch → raise an `InteractionRequired::Consent`-style first-connect approval; on decline → `CLIENT_NOT_APPROVED`.
-4. Return `ClientIdentity{ peer_uid, client_label }`. Never log the token.
+3. If `client_label` is unseen this launch, call `first_connect_consent(client_label)`; on decline → `CLIENT_NOT_APPROVED`. (The caller wires this callback per `PYS_REQUIRE_FIRST_CONNECT_CONSENT`.)
+4. Return `ClientIdentity{ principal, client_label }`, where `principal` is the peer's opaque form (decimal UID on Unix, string SID on Windows). Never log the token or the SID.
 
 **Error Table.**
 | Condition | Code | Status |
 |---|---|---|
-| peer UID ≠ daemon UID | CLIENT_UID_DENIED | conn refused |
+| peer principal ≠ daemon principal, or principal undeterminable (Windows fail-closed) | CLIENT_UID_DENIED | conn refused |
 | connection token mismatch/absent | CLIENT_TOKEN_DENIED | conn refused |
 | new client identity declined | CLIENT_NOT_APPROVED | conn refused |
 
 **Gherkin.**
 ```gherkin
 Feature: ClientAuth
-  Scenario: Happy path — same-UID client with valid token
-    Given a same-UID client presenting the live connection token
+  Scenario: Happy path — same-principal client with valid token
+    Given a client whose peer principal equals the daemon's, presenting the live connection token
     When authenticate is called
     Then it returns a ClientIdentity
   Scenario: Edge — first-connect consent for a new client label
@@ -233,8 +233,8 @@ Feature: ClientAuth
     Given a client presenting an incorrect token
     When authenticate is called
     Then it returns CLIENT_TOKEN_DENIED and the connection is refused
-  Scenario: Error — different UID rejected
-    Given a connection whose peer UID differs from the daemon's
+  Scenario: Error — different principal rejected
+    Given a connection whose peer principal differs from the daemon's (a different Unix UID or Windows SID)
     When authenticate is called
     Then it returns CLIENT_UID_DENIED
 ```
@@ -253,7 +253,7 @@ Feature: ClientAuth
 - `pub fn try_charge(&self, h: &SessionHandle) -> Result<(), SessionError>` — increment the session/run budget; over-budget → `RATE_LIMITED`.
 
 **Internal Logic.**
-1. Key sessions by `(peer_uid, client_label, workspace_id)`; create on first use.
+1. Key sessions by `(principal, client_label, workspace_id)`; create on first use.
 2. Consent decisions and `calls_used` live only in memory; dropped on daemon stop.
 3. `try_charge` enforces `PYS_MAX_CALLS_PER_SESSION`; the per-run cap is charged by the Controller.
 
@@ -563,7 +563,7 @@ Feature: SandboxController
 - Native RPC (length-prefixed JSON): `connect{ clientLabel, token, workspaceId }` → session; `run(RunRequest)` → stream of `{ chunk | interaction_required | result | error }`. (The same operation that C16 wraps as the `python_sandbox` MCP tool.)
 
 **Internal Logic.**
-1. Bind the per-platform transport (ADR-030): a `0600` **Unix domain socket** with `SO_PEERCRED`/`getpeereid` (macOS/Linux) or a **named pipe** with a per-user-SID DACL and a `GetNamedPipeClientProcessId`→token-SID check (Windows); refuse if it cannot be created securely.
+1. Bind the per-platform transport (ADR-030): a `0600` **Unix domain socket** with `SO_PEERCRED`/`getpeereid` (macOS/Linux) or a **named pipe** with a per-user-SID DACL and an `ImpersonateNamedPipeClient`→`TokenUser`-SID (`EqualSid`) check (Windows; never `GetNamedPipeClientProcessId`, a PID-reuse race — see `windows-peer-auth.md`); refuse if it cannot be created securely.
 2. On connect: `ClientAuth.authenticate` (C6) — peer-UID/SID equality **and** the connection token; on success `SessionManager.get_or_create` (C7).
 3. Dispatch `run` to `SandboxController.run`; stream chunks; forward `interaction_required` to the client (or the daemon UI) and resume.
 4. Map every error to the `WireError` envelope (phase-4 registry). Never expose internal state or tokens.
