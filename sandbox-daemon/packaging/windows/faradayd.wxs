@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  faradayd Windows installer (windows-deployment phase 5, ADR-031). A PER-USER .msi (no admin,
+  no UAC elevation — RISK-004): it installs the binary under %LOCALAPPDATA%\faradayd, registers
+  a per-user logon autostart (HKCU ...\Run), and merges the MCP front door into the user's
+  Claude config post-install (faradayd install-mcp-config — idempotent, no clobber), mirroring
+  the macOS .pkg postinstall. Authenticode signing is optional/off by default (build-msi.ps1).
+
+  Build: wix build faradayd.wxs -bindpath bin=<dir-containing-faradayd.exe> -o faradayd.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="faradayd"
+           Manufacturer="faraday"
+           Version="0.1.0"
+           UpgradeCode="7C3A1E20-9B4D-4F6A-8E21-1A2B3C4D5E6F"
+           Scope="perUser">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of faradayd is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="INSTALLFOLDER" Name="faradayd">
+        <Component Id="MainExe">
+          <File Id="faradaydExe" Name="faradayd.exe"
+                Source="!(bindpath.bin)\faradayd.exe" KeyPath="yes" />
+        </Component>
+        <Component Id="Autostart">
+          <!-- Per-user always-on autostart so `mcp-stdio` always finds the daemon. HKCU Run
+               needs no admin (RISK-004); removed automatically on uninstall. -->
+          <RegistryValue Root="HKCU"
+                         Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                         Name="faradayd" Type="string"
+                         Value="&quot;[INSTALLFOLDER]faradayd.exe&quot;" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="faradayd">
+      <ComponentRef Id="MainExe" />
+      <ComponentRef Id="Autostart" />
+    </Feature>
+
+    <!-- Post-install: register the MCP front door in the user's Claude config. Runs the
+         installed binary as the installing user; merge is idempotent and never clobbers
+         other servers. Best-effort (Return="ignore") so a config quirk never fails install. -->
+    <CustomAction Id="InstallMcpConfig" Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[INSTALLFOLDER]faradayd.exe&quot; install-mcp-config"
+                  Execute="deferred" Impersonate="yes" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="InstallMcpConfig" After="InstallFiles" Condition="NOT Installed" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

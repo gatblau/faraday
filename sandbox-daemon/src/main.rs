@@ -163,9 +163,26 @@ fn confirm_via_dialog(summary: &ConsentSummary) -> Option<bool> {
             .ok()?;
         Some(status.success())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        let _ = prompt; // Linux/Windows consent dialogs: follow-up (FU-003).
+        // The per-user daemon runs in the user's interactive session, so it can show a GUI
+        // consent dialog (mirrors the macOS osascript path). Yes ⇒ approved; anything else
+        // (No, or a failure to show the dialog) ⇒ the caller fails closed.
+        //
+        // The prompt is passed via the environment and read as `$env:...`, never interpolated
+        // into the script text, so a client-asserted label cannot inject PowerShell.
+        let script = "Add-Type -AssemblyName PresentationFramework; \
+             if ([System.Windows.MessageBox]::Show($env:FARADAYD_CONSENT_PROMPT,'faradayd consent','YesNo','Question') -eq 'Yes') { exit 0 } else { exit 1 }";
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("FARADAYD_CONSENT_PROMPT", prompt)
+            .status()
+            .ok()?;
+        Some(status.success())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = prompt; // Linux consent dialog (xdg surface): follow-up (FU-003).
         None
     }
 }

@@ -69,6 +69,26 @@ jobs:
         shell: pwsh
         run: ./ci/windows-pentest.ps1
 
+  build-msi:
+    # windows-deployment phase 5: build the per-user .msi (unsigned, ADR-031) and smoke it —
+    # a silent install registers the binary + HKCU autostart + merges the MCP config (no
+    # clobber), and a silent uninstall removes them. The live-daemon round-trip needs PYS_*
+    # config the package does not supply (parity with the macOS .pkg, FU-010).
+    needs: build-windows
+    runs-on: windows-latest
+    defaults: { run: { working-directory: sandbox-daemon } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --bin faradayd
+      - run: dotnet tool install --global wix
+      - name: Build the .msi
+        shell: pwsh
+        run: ./packaging/windows/build-msi.ps1
+      - name: Smoke — install, verify, uninstall
+        shell: pwsh
+        run: ./ci/windows-msi-smoke.ps1
+
   security:
     # Dependency-advisory, licence, ban, and source gate (cargo-deny, ADR-018).
     # No build or Docker needed, so it runs in parallel with `build`.
