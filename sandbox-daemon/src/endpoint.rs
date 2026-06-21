@@ -152,6 +152,21 @@ impl Daemon {
     }
 }
 
+/// Serve `daemon` until `shutdown` resolves — draining in-flight runs (XC10) — then remove the
+/// connection-token file at `token_path` (ADR-024). The platform-specific shutdown trigger is
+/// built by `main` (SIGTERM on Unix, console-control events on Windows); the drain and the token
+/// cleanup are identical on every OS, so both platforms route through here.
+pub async fn serve_and_cleanup(
+    daemon: Daemon,
+    shutdown: impl Future<Output = ()> + Send,
+    token_path: &str,
+) {
+    if let Err(e) = daemon.serve_with_shutdown(shutdown).await {
+        eprintln!("serve error: {e}");
+    }
+    let _ = std::fs::remove_file(token_path);
+}
+
 async fn write_json(conn: &mut Connection, v: &serde_json::Value) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(v).unwrap_or_else(|_| b"{\"code\":\"INTERNAL\"}".to_vec());
     conn.write_frame(&bytes).await

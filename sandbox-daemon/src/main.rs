@@ -376,13 +376,11 @@ async fn main() {
         )
     );
 
-    serve_until_shutdown(daemon).await;
-    // Graceful shutdown drained in-flight runs (XC10); remove the connection token (ADR-024).
-    let _ = std::fs::remove_file(&token_path);
+    serve_until_shutdown(daemon, &token_path).await;
 }
 
 #[cfg(unix)]
-async fn serve_until_shutdown(daemon: Daemon) {
+async fn serve_until_shutdown(daemon: Daemon, token_path: &str) {
     use tokio::signal::unix::{signal, SignalKind};
     let shutdown = async {
         match signal(SignalKind::terminate()) {
@@ -392,14 +390,23 @@ async fn serve_until_shutdown(daemon: Daemon) {
             Err(_) => std::future::pending::<()>().await,
         }
     };
-    if let Err(e) = daemon.serve_with_shutdown(shutdown).await {
-        eprintln!("serve error: {e}");
-    }
+    faradayd::endpoint::serve_and_cleanup(daemon, shutdown, token_path).await;
 }
 
 #[cfg(not(unix))]
-async fn serve_until_shutdown(daemon: Daemon) {
-    if let Err(e) = daemon.serve().await {
-        eprintln!("serve error: {e}");
-    }
+async fn serve_until_shutdown(daemon: Daemon, token_path: &str) {
+    use tokio::signal::windows;
+    // Console-control events for the per-user Run-key process: Ctrl-C, Ctrl-Break, console
+    // close, logoff, and system shutdown. Resolve on the first; a registration failure makes
+    // that one source pend (never fire) rather than abort startup.
+    let shutdown = async {
+        tokio::select! {
+            _ = async { match windows::ctrl_c()       { Ok(mut s) => { s.recv().await; } Err(_) => std::future::pending::<()>().await } } => {}
+            _ = async { match windows::ctrl_break()    { Ok(mut s) => { s.recv().await; } Err(_) => std::future::pending::<()>().await } } => {}
+            _ = async { match windows::ctrl_close()    { Ok(mut s) => { s.recv().await; } Err(_) => std::future::pending::<()>().await } } => {}
+            _ = async { match windows::ctrl_logoff()   { Ok(mut s) => { s.recv().await; } Err(_) => std::future::pending::<()>().await } } => {}
+            _ = async { match windows::ctrl_shutdown() { Ok(mut s) => { s.recv().await; } Err(_) => std::future::pending::<()>().await } } => {}
+        }
+    };
+    faradayd::endpoint::serve_and_cleanup(daemon, shutdown, token_path).await;
 }

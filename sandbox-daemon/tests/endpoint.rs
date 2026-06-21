@@ -313,19 +313,31 @@ async fn c14_input_validation_and_graceful_drain() {
     let socket = dir.join("d.sock").to_string_lossy().into_owned();
     let token_path = dir.join("d.token").to_string_lossy().into_owned();
     let daemon = Daemon::bind(
-        test_config(socket.clone(), token_path),
+        test_config(socket.clone(), token_path.clone()),
         controller(),
         Arc::new(HealthCheck::new("https://idp.example".into(), None)),
     )
     .expect("daemon binds");
     let token = daemon.connection_token().to_string();
+    assert!(
+        std::path::Path::new(&token_path).exists(),
+        "bind wrote the connection token"
+    );
 
-    // Shutdown fires ~1.5s in — while a ~10s real run is in-flight — so serve must DRAIN.
-    let serve = tokio::spawn(async move {
-        daemon
-            .serve_with_shutdown(async { tokio::time::sleep(Duration::from_millis(1500)).await })
+    // Shutdown fires ~1.5s in — while a ~10s real run is in-flight — so serve must DRAIN; then
+    // serve_and_cleanup removes the connection token (ADR-024) — the FU-004 graceful-shutdown path
+    // both platforms route through (`main` builds the SIGTERM / console-control trigger).
+    let serve = {
+        let token_path = token_path.clone();
+        tokio::spawn(async move {
+            faradayd::endpoint::serve_and_cleanup(
+                daemon,
+                async { tokio::time::sleep(Duration::from_millis(1500)).await },
+                &token_path,
+            )
             .await
-    });
+        })
+    };
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let mut s = UnixStream::connect(&socket).await.unwrap();
@@ -366,6 +378,13 @@ async fn c14_input_validation_and_graceful_drain() {
     // serve_with_shutdown returns once the in-flight run has drained.
     let joined = tokio::time::timeout(Duration::from_secs(15), serve).await;
     assert!(joined.is_ok(), "serve drained and returned");
+
+    // FU-004 — the connection token is removed once serve drains and returns (the cleanup the
+    // Windows path previously skipped by never returning from `serve()`).
+    assert!(
+        !std::path::Path::new(&token_path).exists(),
+        "connection token removed on graceful shutdown"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
