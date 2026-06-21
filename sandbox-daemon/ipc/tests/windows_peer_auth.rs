@@ -76,7 +76,8 @@ async fn anonymous_client_does_not_match_the_daemon_principal() {
 #[tokio::test]
 async fn name_squatting_is_defeated_at_bind() {
     let pipe = unique_pipe("squat");
-    let _first = Listener::bind(&pipe, temp_token("squat-a").to_str().unwrap()).expect("first bind");
+    let _first =
+        Listener::bind(&pipe, temp_token("squat-a").to_str().unwrap()).expect("first bind");
     let second = Listener::bind(&pipe, temp_token("squat-b").to_str().unwrap());
     assert!(
         second.is_err(),
