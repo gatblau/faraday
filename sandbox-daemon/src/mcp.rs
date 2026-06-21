@@ -12,9 +12,9 @@
 //! contain embedded newlines). **stdout is reserved for the protocol** — all
 //! diagnostics go to stderr, and the connection token is never logged (XC3).
 
+use faradayd_ipc::Connection;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 /// The MCP protocol version echoed when the client does not request one.
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -176,19 +176,19 @@ async fn relay_run(request: &Value) -> Result<Value, String> {
     })?;
     let token = token.trim().to_string();
 
-    let mut stream = UnixStream::connect(&socket_path)
+    let mut conn = faradayd_ipc::connect(&socket_path)
         .await
         .map_err(|_| "DAEMON_UNAVAILABLE: cannot reach the daemon control socket".to_string())?;
 
     // Handshake: connect with the connection token (ADR-024). The MCP front door is a client.
     write_frame(
-        &mut stream,
+        &mut conn,
         &json!({ "type": "connect", "clientLabel": "mcp", "token": token, "workspaceId": "default" }),
     )
     .await
     .map_err(|_| "DAEMON_UNAVAILABLE: connect write failed".to_string())?;
 
-    let connected = read_frame(&mut stream)
+    let connected = read_frame(&mut conn)
         .await
         .map_err(|_| "DAEMON_UNAVAILABLE: no connect response".to_string())?
         .ok_or_else(|| "DAEMON_UNAVAILABLE: daemon closed the connection".to_string())?;
@@ -197,13 +197,13 @@ async fn relay_run(request: &Value) -> Result<Value, String> {
     }
 
     // Run.
-    write_frame(&mut stream, &json!({ "type": "run", "request": request }))
+    write_frame(&mut conn, &json!({ "type": "run", "request": request }))
         .await
         .map_err(|_| "DAEMON_UNAVAILABLE: run write failed".to_string())?;
 
     // Read frames until a terminal one (result / dryRun / error), ignoring stream chunks.
     loop {
-        let frame = read_frame(&mut stream)
+        let frame = read_frame(&mut conn)
             .await
             .map_err(|_| "DAEMON_UNAVAILABLE: read failed".to_string())?
             .ok_or_else(|| "DAEMON_UNAVAILABLE: daemon closed before a result".to_string())?;
@@ -262,28 +262,17 @@ async fn write_msg(stdout: &mut tokio::io::Stdout, v: &Value) -> std::io::Result
 }
 
 // ---- daemon control-socket framing (4-byte big-endian length prefix + JSON) ----
+// The length-prefix framing lives in the faradayd-ipc seam; these helpers only map
+// between JSON values and the seam's byte frames.
 
-async fn write_frame(stream: &mut UnixStream, v: &Value) -> std::io::Result<()> {
+async fn write_frame(conn: &mut Connection, v: &Value) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(v).unwrap_or_default();
-    stream
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .await?;
-    stream.write_all(&bytes).await?;
-    stream.flush().await
+    conn.write_frame(&bytes).await
 }
 
-async fn read_frame(stream: &mut UnixStream) -> std::io::Result<Option<Value>> {
-    let mut len_buf = [0u8; 4];
-    match stream.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    Ok(serde_json::from_slice(&buf).ok())
+async fn read_frame(conn: &mut Connection) -> std::io::Result<Option<Value>> {
+    Ok(conn
+        .read_frame()
+        .await?
+        .and_then(|buf| serde_json::from_slice(&buf).ok()))
 }
-
-// `read_exact` on UnixStream comes from AsyncReadExt.
-use tokio::io::AsyncReadExt;

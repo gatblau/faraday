@@ -7,25 +7,9 @@ use crate::types::ClientIdentity;
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-/// The server-derived identity of a connecting peer (never client-asserted). Unix uses
-/// the numeric UID; a `Windows(sid)` variant lands in a later phase (windows-peer-auth
-/// §4). Rendered to the opaque, platform-neutral string stored in
-/// `ClientIdentity.principal` via [`PeerPrincipal::as_principal`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PeerPrincipal {
-    Unix(u32),
-}
-
-impl PeerPrincipal {
-    /// The opaque, platform-neutral string form: the decimal UID on Unix — a lossless
-    /// re-encoding of the integer UID, so a `principal`-keyed session means exactly what
-    /// the old `peer_uid`-keyed session meant.
-    pub fn as_principal(&self) -> String {
-        match self {
-            PeerPrincipal::Unix(uid) => uid.to_string(),
-        }
-    }
-}
+/// The server-derived peer identity now lives in the `faradayd-ipc` transport seam
+/// (windows-deployment phase 2), re-exported here so call sites keep `clientauth::PeerPrincipal`.
+pub use faradayd_ipc::PeerPrincipal;
 
 pub struct ClientAuth {
     daemon: PeerPrincipal,
@@ -76,15 +60,6 @@ impl ClientAuth {
             client_label: client_label.to_string(),
         })
     }
-}
-
-/// Mint a 128-bit CSPRNG connection token (hex). Reads `/dev/urandom` on unix.
-#[cfg(unix)]
-pub fn mint_token() -> std::io::Result<String> {
-    use std::io::Read;
-    let mut bytes = [0u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Length-checked constant-time byte comparison of the connection token.

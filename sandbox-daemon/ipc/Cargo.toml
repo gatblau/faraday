@@ -1,0 +1,21 @@
+# faradayd-ipc — the local control-plane IPC seam (windows-deployment phase 2).
+# Houses everything platform-specific about the daemon's local control transport so the
+# daemon's wire protocol (C14) and MCP front door (C16) stay platform-neutral. Unix uses
+# a 0600 Unix-domain socket + SO_PEERCRED; the Windows named-pipe + SID peer-auth lands
+# in phase 3 (docs/spec/sandbox-daemon/windows-peer-auth.md). Until then the Windows half
+# is a stub that fails closed with `Unsupported`.
+[package]
+name = "faradayd-ipc"
+version = "0.1.0"
+edition = "2021"
+description = "Local control-plane IPC seam for faradayd: platform transport, peer principal, framed protocol."
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util"] }
+# OS CSPRNG for the connection-token mint: /dev/urandom family on Unix, BCryptGenRandom
+# on Windows — one cross-platform source replacing the two /dev/urandom copies.
+getrandom = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

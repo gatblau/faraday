@@ -2,6 +2,14 @@
 # Phase 0 (docs/wip/plan/02-sandbox-daemon-build.md) establishes the buildable
 # single-binary layout that boots, binds a 0600 control socket, writes the 0600
 # connection-token file, and answers a health check. Later phases fill the modules.
+
+# Workspace root: the daemon package plus the faradayd-ipc transport seam
+# (windows-deployment phase 2). `guest/` is excluded — it is its own workspace root,
+# built separately for wasm32-wasip1.
+[workspace]
+members = ["ipc"]
+exclude = ["guest"]
+
 [package]
 name = "faradayd"
 version = "0.1.0"
@@ -22,6 +30,9 @@ path = "src/main.rs"
 integration = []
 
 [dependencies]
+# The local control-plane IPC seam: platform transport + peer principal + framed protocol
+# (windows-deployment phase 2). Keeps endpoint.rs/mcp.rs platform-neutral.
+faradayd-ipc = { path = "ipc" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
