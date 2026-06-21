@@ -129,7 +129,7 @@ Feature: HealthCheck
 **Policy spec.** `RunRequest` decoded with strict/unknown-field-rejecting serde; `code` size-capped; `requested_capabilities` match `^[a-z0-9]+(\.[a-z0-9]+)*$`; path canonicalised and `..`-rejected by C4; the step-up signal is **never** a request field (raised only by the daemon). Malformed → `400 VAL_ERR`. **Gaps:** None.
 
 ### XC10 — Graceful Shutdown
-**Policy spec.** `SIGTERM`/`SIGINT` (and Windows service stop): stop accepting connections, drain in-flight runs (bounded deadline), terminate WASM instances and drop linear memory, flush the OTLP exporter, invalidate live `capId`s, delete the connection-token file. **Gaps:** None.
+**Policy spec.** On a stop signal — `SIGTERM`/`SIGINT` on Unix; on Windows the console-control events (`Ctrl-C`, `Ctrl-Break`, console close, logoff, system shutdown) for the per-user process — stop accepting connections, drain in-flight runs (bounded deadline), terminate WASM instances and drop linear memory, flush the OTLP exporter, invalidate live `capId`s, delete the connection-token file. (A real Windows Service stop handler, for a Service-based autostart rather than the per-user Run-key process, is a follow-up.) **Gaps:** None.
 
 ### XC11 — Out of scope
 Pagination (the guest handles it), CORS (no browser origin; the socket is local-only), and DB migrations (no relational schema) do not apply (AS-21). Recorded so their absence is a decision, not an omission.
