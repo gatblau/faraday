@@ -1,320 +1,368 @@
-# Security Threat Model — `faradayd` (sandbox daemon) + `obo-broker`
+# Security Threat Model — `faradayd` and the on-behalf-of broker
 
-An AI agent writes Python and wants it to call real APIs — GitHub, corporate services — on the user's behalf. The agent is untrusted and may be steered by prompt injection. The entire design exists to let that code reach approved APIs **without ever handing it the tokens those APIs require.**
+An AI agent writes Python and wants it to call real APIs — GitHub, corporate services, keyed SaaS, public endpoints — on someone's behalf. The agent is untrusted and can be steered by prompt injection. The whole system exists to let that code reach approved APIs **without ever handing it the credentials those APIs need.**
 
-This document walks every trust boundary in the system through STRIDE and records what stops each class of attack, which requirement that maps to, and what risk is left over.
+This document is self-contained: it states each control in full so a reader needs no other file to follow it. It walks every trust boundary through a six-way checklist (below) and records what stops each kind of attack, which requirement that maps to, and what risk is left.
 
-**Terms used below.** 
-- `capId` — an unguessable, single-use ticket the sandbox presents to request one pre-approved action; it carries no secret. 
-- **Identity Broker** — the only component holding real tokens; it makes API calls itself rather than handing tokens out. 
-- **`obo-broker`** — a company-server component that exchanges the user's sign-in proof (`id_token`) for a corporate token and keeps that token server-side. 
-- **Step-up** — a forced re-authentication before a sensitive write. 
-- **Fail-closed** — on any error or missing rule, deny. 
-- **ADR-NNN** — a numbered design decision in the design folders. 
-- **SR / RR / TB / Zn** — this document's labels for requirements, residual risks, trust boundaries, and zones.
-- **STRIDE** is the six-way checklist applied at each boundary: **S**poofing (impersonation), **T**ampering (altering data), **R**epudiation (denying an action), **I**nformation disclosure (here, almost always a token leak), **D**enial of service, **E**levation of privilege.
+It covers **two ways the same program is deployed:**
 
-## 1. System and adversary
+- **Desktop:** the daemon runs as a developer's own operating-system user on their laptop. A human signs in; client tools reach the daemon over a local channel (a Unix-domain socket on macOS/Linux, a named pipe on Windows).
+- **Server:** the daemon runs inside a container, **one daemon per agent service**, serving a headless agent with no human present. It adds two credential styles that need no sign-in (a static API key, or no credential at all) and replaces a human's "yes" with an administrator-signed policy.
 
-`faradayd` is a per-user Rust daemon. It runs the agent's Python inside a WebAssembly sandbox (RustPython on Wasmtime) that has no network, filesystem, or process access of its own, and lets that code reach only allowlisted APIs through one gatekeeper — the in-daemon Identity Broker. Corporate token exchange is delegated to the server-side `obo-broker`. The tools the agent runs under (IDE, CLI, harness) are thin clients that connect over a local socket — either directly over the faraday-native RPC, or by spawning the `faradayd mcp-stdio` front door (an MCP JSON-RPC subprocess, ADR-028) — and ask the daemon to `run` code.
+Both share one program, one rule engine, one sandbox, and the same promise: credentials never reach the agent's code.
 
-- **Adversary:** the agent and the Python it writes, possibly under prompt injection.
-- **Out of scope:** the user attacking their own machine (ADR-002). The daemon runs as them; they already hold their own access.
-- **New surface in this design:** the daemon is long-lived, so any same-UID process can try to connect and drive it (**TB1**). The old extension model had no equivalent.
-- **The one invariant:** tokens never enter the agent's code, and corporate tokens never reach the laptop at all.
+**Terms used below.**
+- **capId** — a single-use, unguessable ticket the sandbox hands back to ask for one pre-approved action. It carries no secret and is worthless once used or after five minutes.
+- **Broker** — the one part of the daemon that holds real credentials. It makes the API call itself and returns only the data, so the credential never leaves it.
+- **On-behalf-of broker** — a separate company server that swaps a user's sign-in proof for a real corporate token and keeps that token on the server, never sending it to the laptop.
+- **Auth mode** — the per-API rule for what credential to use: *exchange* (the company server swaps the sign-in proof for a corporate token), *passthrough* (use the user's own sign-in token directly), *api key* (a static key, server deployment), or *none* (no credential, server deployment).
+- **Step-up** — forcing a fresh human re-authentication before a risky write.
+- **Write gate** — every API rule is read-only (it may only fetch) unless an administrator-signed policy explicitly allows it to write.
+- **Fail-closed** — on any error, missing rule, or uncertainty, deny.
+- **Connection token** — a random secret the daemon writes at startup to a file only its own user can read; a client must present it to connect.
+- **SR / RR / TB / Zn** — this document's own labels for requirements, residual risks, trust boundaries, and zones.
+- The six-way checklist applied at each boundary: **Spoofing** (pretending to be someone), **Tampering** (altering data), **Repudiation** (denying you did it), **Information disclosure** (here, almost always a leaked credential), **Denial of service**, **Elevation of privilege** (gaining more than you were granted).
+
+## 1. The system and the attacker
+
+The daemon runs the agent's Python inside a sealed sandbox that has no network, no filesystem, and no way to start other programs. The only way out of the sandbox is a single door to the broker, which is the only component that holds credentials. The agent's host tools (an IDE, a CLI, a test harness, or a headless server agent) are thin clients: they connect over a local channel and ask the daemon to run code. One of those clients is a small front-door process the agent host launches per session to speak the agent-tooling protocol; it holds no credentials and connects like any other client.
+
+- **The attacker:** the agent and the Python it writes, possibly under prompt injection.
+- **Out of scope:** the person who owns the machine attacking their own machine — desktop user or server operator. The daemon already runs as them; they hold their own access.
+- **The new exposure:** the daemon is always running, so any process that shares its identity (the same OS user on a laptop, or the same container on a server) can try to connect and drive it. The earlier IDE-extension model had nothing equivalent.
+- **What changes on the server:** there is no human to sign in, approve, or re-authenticate, and the daemon may hold **static, long-lived API keys** in mounted files rather than only short-lived sign-in tokens. The "yes" a human would give is instead carried by an administrator's signature on the policy.
+- **The one rule that never bends:** credentials never enter the agent's code, never return to the client, and corporate tokens never reach the laptop at all.
 
 ## 2. Assumptions
 
 | ID | Assumption |
 |---|---|
-| A-1 | One daemon per OS user, running under that user's UID; no cross-user sharing. |
-| A-2 | Consent is cached in memory per `(client, workspace)` session, never persisted. |
-| A-3 | The user has signed in (OIDC); the `id_token` stays inside the daemon (ADR-002 / ADR-010). |
-| A-4 | The control socket is local-only — UDS `0600` or a per-user named pipe. No network listener. |
-| A-5 | `pysandbox.policy.json` is the authorisation contract; its schema is `sandbox-daemon/11-policy-schema.md` + `sandbox-daemon/schema/pysandbox.policy.schema.json`. |
-| A-6 | The bundled RustPython/WASM artefact and crate tree are pinned, digest-checked, and verified before instantiation (ADR-018). |
-| A-7 | For direct providers (e.g. `github`) the daemon broker is the sole gate; for token-exchange providers `obo-broker` re-checks server-side. |
+| A-1 | One daemon serves one identity — one OS user on a laptop, or one agent service in one container. A daemon is never shared across identities. |
+| A-2 | A user's approvals are remembered only in memory, per client-and-workspace, and are never written to disk. (On the server there is no interactive approval — see A-9.) |
+| A-3 | A human sign-in is needed only for the *exchange* and *passthrough* credential styles. A server deployment using only static keys or no-credential calls has no human and no sign-in; sign-in settings are required only when the policy actually contains a capability that needs them. |
+| A-4 | The control channel is local only — a private socket on macOS/Linux or a private named pipe on Windows, in both cases reachable only by the daemon's own identity and gated by the connection token. The daemon never listens on the network. |
+| A-5 | The policy file is the authorisation contract: it lists every allowed API by host, path, and method. Nothing not on the list is reachable. |
+| A-6 | The bundled Python-in-sandbox build and all its dependencies are pinned and checked against a known fingerprint before they run. |
+| A-7 | For APIs called with a direct credential, the daemon's broker is the only gate; for APIs that go through the company on-behalf-of server, that server re-checks the rules a second time. |
+| A-8 | (Server) API keys are supplied as read-only mounted files the deployment manages. The daemon reads each once at startup into memory and never writes it anywhere else. There is one key per API rule. |
+| A-9 | (Server) There is no human, so there is no interactive approval or step-up. Writes are pre-authorised by an administrator-signed policy; a policy that asks for step-up on a no-human capability is rejected when it loads. |
+| A-10 | (Server) Operating with real credentials requires a working audit destination. Without one, the daemon refuses to use real credentials and runs in a mock-only mode that sends none. |
+| A-11 | The container or host the server daemon runs in is trusted to the same degree as the keys mounted into it; a full container break-in is the operator compromising their own deployment, bounded by RR-6. |
 
 ## 3. Data flow and trust boundaries
 
-Zones are grouped by trust: 🔴 untrusted, 🟢 trusted, 🔵 external party or infrastructure. Labelled arrows crossing a zone wall are the trust boundaries (`TBn`) examined in §5. Read top to bottom; sanitised responses return along the same paths and are omitted.
+Zones are grouped by trust: 🔴 untrusted, 🟢 trusted, 🔵 outside party or infrastructure. Arrows that cross a zone wall are the trust boundaries (`TBn`) examined in section 5. Read each diagram top to bottom; sanitised responses come back along the same arrows and are left out.
 
-The whole laptop side is now **one** Rust process (the dashed box). Internal arrows carry no `TBn` label because they cross no trust line. The two new boundaries are **TB1** (client → daemon) and **TB6** (user → consent screen); **TB2a** is a property of the sandbox engine, not an arrow, so it is noted on the engine's box. The two diagrams join at **TB4**, the only laptop↔server link.
+The whole laptop or container side is **one** program (the dashed box). Arrows inside it carry no boundary label because they cross no trust line. The new boundaries are **TB1** (a client reaching the daemon), **TB6** (a user at the approval screen, desktop only), and **TB10** (the broker reading a mounted secret, server only).
 
-The **`faradayd mcp-stdio` front door** is shown inside Zone 0, on the untrusted client side. It is a per-session subprocess the agent host spawns (the same daemon binary in a sub-mode, version-locked, ADR-026/ADR-028); it holds no tokens, runs the untrusted MCP parsing outside the credential-holding daemon, reads the user's `0600` connection token, and connects to the control socket as an ordinary client. It therefore **introduces no new boundary** — it crosses **TB1** exactly as a direct native-RPC client does, and every TB1 mitigation in §5 applies to it unchanged.
+**How the daemon knows who is connecting (TB1).** On macOS and Linux the operating system tells the daemon which user owns the connecting process, and the daemon rejects any user that is not its own. On Windows the daemon briefly impersonates the connecting client, reads that client's security identifier (its SID), checks it is equal to the daemon's own, and immediately stops impersonating. It deliberately does **not** identify the caller by looking up a process ID, because process IDs are recycled and a different program could inherit one. On every platform the client must also present the connection token. The token file is readable only by the daemon's own user.
 
-### Diagram A — laptop (`faradayd`)
+### Diagram A — laptop (desktop deployment)
 
 ```mermaid
-flowchart TB
-  subgraph Z0["Zone 0 · Agent / client (untrusted)"]
-    agent["Agent host / IDE / CLI / harness"]
-    mcp["faradayd mcp-stdio<br/>per-session MCP front door<br/>(untrusted client · holds no tokens · ADR-028)"]
-  end
-  subgraph ZU["Zone U · User"]
-    user["Developer"]
-  end
+flowchart TD
+  agent["Agent host / IDE / CLI / harness<br/>(untrusted)"]
+  frontdoor["Per-session front-door process<br/>(untrusted client, holds no credentials)"]
+  user["Developer"]
 
-  subgraph D["🖥️ faradayd — one Rust process, runs as the user"]
-    direction TB
-    subgraph Zctl["Zctl · Front door: connection, caller check, sessions"]
-      ctl["local socket"]
-    end
-    subgraph Zui["Zui · Sign-in / consent / step-up screen"]
-      ui["daemon-owned UI"]
-    end
-    subgraph Z1r["Zone 1r · Sandbox engine (Rust · Wasmtime) — TB2a: locked-down config + pinned artefact"]
-      shim["broker shim — the only doorway out"]
-      subgraph Z1["Zone 1 · Agent Python, sealed (untrusted)"]
-        code["agent Python"] --- sdk["pysandbox_sdk"]
-      end
-    end
-    subgraph Z3["Zone 3 · Identity Broker — tokens · policy · audit"]
-      broker["tokens · capId lookup · allowlist · sanitiser"]
-    end
-  end
+  socket["Daemon front door<br/>local socket / named pipe"]
+  ui["Daemon-owned sign-in / approval screen"]
+  sandbox["Sandbox engine — sealed, locked-down config"]
+  code["Agent Python (sealed, untrusted)"]
+  broker["Broker — holds tokens, checks rules, sanitises, audits"]
 
-  subgraph Z3b["Zone 3b · OS keychain / sign-in cache"]
-    keychain["keychain / OIDC session"]
-  end
-  extapi["Zone X · External APIs (e.g. GitHub)"]
-  siem["Zone Obs · SIEM"]
-  clusterB(["obo-broker ▶ Diagram B"])
+  keychain["OS keychain / sign-in cache"]
+  extapi["External APIs (e.g. GitHub)"]
+  siem["Audit destination"]
+  obo["On-behalf-of broker (company server) — Diagram B"]
 
-  agent -->|"spawn + MCP JSON-RPC (stdio)"| mcp
-  mcp -->|"TB1 · connect+run — caller checked by UID + connection token"| ctl
-  agent -->|"TB1 · native RPC run() — caller checked by UID + connection token"| ctl
-  user -->|"TB6 · sign-in · consent · step-up"| ui
-  ctl -->|"start sandbox + load code (internal)"| shim
-  ctl -->|"mint capIds (internal)"| broker
-  sdk -->|"TB2 · {capId, verb, path}"| shim
-  shim -->|"TB3 · forward request — no token crosses"| broker
+  agent -->|"launches"| frontdoor
+  frontdoor -->|"TB1 · connect + run<br/>checked by identity + connection token"| socket
+  agent -->|"TB1 · connect + run<br/>checked by identity + connection token"| socket
+  user -->|"TB6 · sign-in / approve / step-up"| ui
+  socket -->|"start sandbox, load code"| sandbox
+  sandbox --- code
+  socket -->|"issue capIds"| broker
+  code -->|"TB2 · capId + method + path"| sandbox
+  sandbox -->|"TB3 · forward request, no credential crosses"| broker
   broker -->|"TB8 · read tokens"| keychain
-  broker -->|"TB5 · HTTPS + Bearer"| extapi
-  broker -->|"TB9 · audit"| siem
-  broker ==>|"TB4 · exchange (id_token)"| clusterB
+  broker -->|"TB5 · HTTPS call with credential"| extapi
+  broker -->|"TB9 · audit record"| siem
+  broker -->|"TB4 · swap sign-in proof for a corporate token"| obo
 
   classDef untrusted fill:#ffd9d9,stroke:#c0392b,color:#000
   classDef trusted fill:#d9f2d9,stroke:#27ae60,color:#000
   classDef ext fill:#dbe9ff,stroke:#2c6fbf,color:#000
-  classDef link fill:#dbe9ff,stroke:#2c6fbf,stroke-width:2px,stroke-dasharray:5 3,color:#000
-  class Z0,Z1 untrusted
-  class ZU,Zctl,Zui,Z1r,Z3,Z3b trusted
-  class extapi,siem ext
-  class clusterB link
-  style D fill:none,stroke:#555,stroke-dasharray:4 3
+  class agent,frontdoor,code untrusted
+  class user,socket,ui,sandbox,broker,keychain trusted
+  class extapi,siem,obo ext
 ```
 
-### Diagram B — server (`obo-broker`)
+### Diagram B — company server (on-behalf-of broker)
 
 ```mermaid
-flowchart TB
-  brokerA(["Identity Broker (laptop)<br/>◀ Diagram A"])
+flowchart TD
+  brokerA["Daemon broker (laptop) — Diagram A"]
+  svc["On-behalf-of broker:<br/>swap token, re-check rules, sanitise, audit"]
+  store["Encrypted token store<br/>never returned to the laptop"]
+  idp["Sign-in service (the company's single sign-on)"]
+  capi["Corporate APIs (allow-listed)"]
 
-  subgraph SRV["☸️ obo-broker — company cluster (separate design doc)"]
-    direction TB
-    subgraph Zobo["Zobo · obo-broker (trusted; holds the corporate credential)"]
-      svc["token exchange · re-check policy · sanitise · audit"]
-      cache["encrypted token store (obo-broker ADR-011/018)<br/>never returned to the laptop"]
-      svc --- cache
-    end
-  end
-
-  idp["Zone IdP · Sign-in service (OIDC — Okta / Keycloak / Entra)"]
-  capi["Zone X · Corporate APIs (allowlisted)"]
-
-  brokerA ==>|"TB4 · exchange request (id_token)"| svc
-  svc -->|"TB7 · RFC 8693 token exchange"| idp
-  svc -.->|"corporate API call (obo-broker design doc)"| capi
+  brokerA -->|"TB4 · send sign-in proof"| svc
+  svc --- store
+  svc -->|"TB7 · token exchange"| idp
+  svc -->|"corporate API call"| capi
 
   classDef trusted fill:#d9f2d9,stroke:#27ae60,color:#000
   classDef ext fill:#dbe9ff,stroke:#2c6fbf,color:#000
-  classDef link fill:#dbe9ff,stroke:#2c6fbf,stroke-width:2px,stroke-dasharray:5 3,color:#000
-  class Zobo trusted
+  class svc,store trusted
   class idp,capi ext
-  class brokerA link
-  style SRV fill:none,stroke:#555,stroke-dasharray:4 3
+```
+
+### Diagram C — container (server deployment)
+
+The server deployment keeps the same client → daemon → sandbox → broker path, but there is **no human** (no sign-in or approval screen), and for static-key and no-credential APIs it **replaces** the company-server step with either a key read from a mounted file (**TB10**) or no credential at all. The agent and the daemon share one container and one identity.
+
+```mermaid
+flowchart TD
+  sagent["Headless server agent (untrusted)"]
+  socket2["Daemon front door<br/>local socket + connection token"]
+  broker2["Broker — static-key store, rule check, audit"]
+  keys["Mounted secret files (read-only):<br/>per-API keys, audit key, admin signing key"]
+  pub["Keyed or public external APIs (allow-listed)"]
+  siem2["Audit destination (required for real credentials)"]
+
+  sagent -->|"TB1 · connect + run<br/>same-identity + connection token"| socket2
+  broker2 -->|"TB10 · read each key once at startup"| keys
+  broker2 -->|"TB5 · HTTPS with the API key, or no credential"| pub
+  broker2 -->|"TB9 · audit record (no credential)"| siem2
+
+  classDef untrusted fill:#ffd9d9,stroke:#c0392b,color:#000
+  classDef trusted fill:#d9f2d9,stroke:#27ae60,color:#000
+  classDef ext fill:#dbe9ff,stroke:#2c6fbf,color:#000
+  class sagent untrusted
+  class socket2,broker2,keys trusted
+  class pub,siem2 ext
 ```
 
 ## 4. Trust zones
 
-| Zone | Component | Trust |
+| Zone | What it is | Trust |
 |---|---|---|
-| **Z0** | Agent / client | Untrusted; identified by peer-UID + connection token, never as a principal (`sandbox-daemon/01-context.md`). |
-| **ZU** | User | Trusted on their own machine; signs in and grants consent. |
-| **Z1** | Agent Python, sealed in WASM | Untrusted; reaches the outside only through the single broker shim (ADR-013 / ADR-014). |
-| **Z1r** | Sandbox engine (Rust · Wasmtime) | Trusted for the seal, but holds no tokens (ADR-010) — a breach yields no credentials. |
-| **Zctl** | Front door: connection, caller check, sessions | Trusted; enforces the client↔daemon boundary (ADR-024). |
-| **Zui** | Sign-in / consent / step-up screen | Trusted; sole decider of whether the user approved (ADR-025). |
-| **Z3** | Identity Broker | Trusted; holds every token and owns the rules. |
-| **Z3b** | OS keychain / sign-in cache | Trusted; where tokens rest. |
-| **Zobo** | Backend `obo-broker` | Trusted, server-side; holds the corporate credential (separate doc). |
-| **ZIdP** | Sign-in service (OIDC; no default — Okta / Keycloak / Entra) | Trusted third party. |
-| **ZX** | External / corporate APIs | External; allowlisted hosts only. |
+| **Z0** | Agent / client (IDE, CLI, headless agent, front-door process) | Untrusted. Identified only by the operating-system identity behind the connection plus the connection token — never accepted as a named user of the daemon. |
+| **ZU** | The user (desktop only) | Trusted on their own machine; signs in and approves. Absent on the server. |
+| **Z1** | The agent's Python, sealed in the sandbox | Untrusted. Reaches the outside only through the one broker door. |
+| **Z1r** | The sandbox engine | Trusted to hold the seal, but holds no credentials — breaking it yields none. |
+| **Zctl** | The daemon front door: connection, caller check, sessions | Trusted; enforces the client-to-daemon boundary. |
+| **Zui** | Sign-in / approval screen (desktop only) | Trusted; the only thing that can decide the user said yes. |
+| **Z3** | The broker | Trusted; holds every credential (sign-in tokens, or static keys on the server) and owns the rules. |
+| **Z3b** | OS keychain / sign-in cache (desktop) | Trusted; where sign-in tokens rest. |
+| **Zsec** | Mounted secret files (server only) | Trusted; read-only files holding the static API keys, the audit key, and the admin signing key. |
+| **Zobo** | The company on-behalf-of broker | Trusted, server-side; holds the corporate credential. |
+| **ZIdP** | The sign-in service | Trusted outside party. Used only by the *exchange* and *passthrough* styles. |
+| **ZX** | External, corporate, keyed, or public APIs | Outside; only allow-listed hosts are reachable. |
 
-## 5. Trust boundaries (STRIDE)
+## 5. Trust boundaries
 
-The **SR** column links each mitigation to the requirement it satisfies (§6). Only the applicable STRIDE rows are listed.
+The **SR** column links each defence to the requirement it satisfies (section 6). Only the relevant checklist rows are listed.
 
-### TB1 — Client (Z0) → daemon front door (Zctl). *New; the central new surface.*
-Any same-UID process can reach the socket. The job here is to obey only the approved client, and to keep even an unapproved same-UID caller within what the user could already do. The `faradayd mcp-stdio` front door is one such client: it connects here over the same boundary and is held to every mitigation below — it gains no authority a direct client lacks (ADR-028).
+### TB1 — a client reaches the daemon front door. *The central new exposure.*
+Any process that shares the daemon's identity (same OS user on a laptop, same container on a server) can reach the channel. The job is to obey only the approved client, and to keep even an unapproved same-identity caller within what that identity could already do anyway. The per-session front-door process is one such client and is held to every defence below.
 
-| | Threat | Mitigation | SR |
+| | Threat | Defence | SR |
 |---|---|---|---|
-| **S** | A process that is not the approved client drives the daemon — mints caps, replays a leaked `capId` | Peer-UID check (`SO_PEERCRED` / `getpeereid` / `GetNamedPipeClientProcessId`) + a per-launch connection token (`0600` file) + optional first-connect consent for a new client (ADR-024) | SR-1, SR-3 |
-| **T** | Malformed `RunRequest` — oversize code, bad cap ids, injected fields | Strict parsing rejecting unknown fields, code size cap, cap-id pattern; step-up can never be a request field (XC9) | SR-6 |
-| **R** | Client denies issuing a run | Server-minted `run_id` + keyed-HMAC user id recorded per call, with the server-verified peer UID (XC3); `client_label` is a client-asserted hint, not proof of which tool (RR-5) | SR-9 |
-| **I** | Another process reads the connection token | `0600`, same-UID only — the one accepted residual (RR-2), equivalent to the user's own authority (ADR-002 / ADR-024) | SR-1 |
-| **D** | A client floods `run()` | Per-run/session call budgets; WASM fuel/epoch cap any single run | SR-8 |
-| **E** | Same-UID caller escalates from connecting to *using* a token | Tokens never cross the socket (only `{capId, verb, path}`); consent + allowlist + budgets + audit hold it to granted capabilities (RR-2) | SR-2, SR-4 |
+| Spoofing | A process that is not the approved client drives the daemon — issues caps, replays a leaked capId | The daemon checks who is connecting using the operating system, not the caller's word: the connecting user's identity on macOS/Linux, or the connecting client's security identifier on Windows (read by briefly impersonating it, never by a recyclable process-ID lookup). It must also present the connection token, and a brand-new client identity prompts a first-time approval. | SR-1, SR-3, SR-24 |
+| Tampering | A malformed run request — oversized code, bad cap ids, injected fields | Strict parsing that rejects unknown fields, a code-size cap, and a fixed cap-id shape; "step-up was done" can never be a field in the request. | SR-6 |
+| Repudiation | A client denies it asked for a run | Each call is recorded with a server-generated run id, a one-way hash of the user id (or a fixed service identity when headless), and the identity the operating system verified. The self-declared tool name is only a hint. | SR-9 |
+| Information disclosure | Another same-identity process reads the connection token | The token file is readable only by the daemon's own user. That a same-identity process can read it is the one accepted residual (RR-2) — it is the identity's own authority. | SR-1, SR-24 |
+| Denial of service | A client floods the run entry | Per-run and per-session call budgets; the sandbox's own CPU and time limits cap any single run. | SR-8 |
+| Elevation | A same-identity caller goes from connecting to actually *using* a credential | Credentials never cross the channel (only a capId, a method, and a path do); approval (desktop) or the administrator-signed write gate (server), plus the allow-list, budgets, and audit, hold it to exactly the granted actions. | SR-2, SR-4, SR-27 |
 
-### TB2 — Agent Python (Z1) → sandbox engine (Z1r). *The seal.*
+### TB2 — the agent's Python reaches the sandbox engine. *The seal.*
 
-| | Threat | Mitigation | SR |
+| | Threat | Defence | SR |
 |---|---|---|---|
-| **S** | Forge or guess a `capId` to act as another capability | Unguessable 128-bit single-use `capId`; the broker, not the shim, resolves it to `{provider, host, method, expiry}` (`sandbox-daemon/02-architecture.md`) | SR-5 |
-| **T** | Path traversal or header/method injection in the request | The Rust shim canonicalises and validates (rejects `..`, header + method allowlist); the broker re-checks, fail-closed | SR-6, SR-22 |
-| **I** | Open a socket to bypass the broker | No WASI socket exists — the only host import is the broker shim (ADR-013) | SR-7 |
-| **D** | Runaway code — infinite loop, ReDoS, memory bomb | Wasmtime fuel (CPU), epoch deadline (wall clock), max linear memory; floods bounded by budgets (ADR-019) | SR-8 |
-| **E** | `ctypes` / subprocess escape | No FFI or process model exists in WASM; the only residual is a Wasmtime engine flaw (RR-1) | SR-7 |
-| **E/I** | Confused deputy — trick the shim into over-reaching | The shim exposes one function and re-derives the target from the `capId` via the broker, never from guest strings | SR-22 |
+| Spoofing | Forge or guess a capId to act as another capability | A capId is an unguessable single-use 128-bit value; the broker, not the sandbox, resolves it to a real target. | SR-5 |
+| Tampering | Path traversal or method injection in the request | The sandbox door rejects `..` and anything off the method allow-list, and the broker re-checks, fail-closed. | SR-6, SR-22 |
+| Information disclosure | Open a socket to slip past the broker | The sandbox has no socket capability at all — the only way out is the single broker door. | SR-7 |
+| Denial of service | Runaway code — endless loop, runaway regex, memory bomb | Hard CPU, wall-clock, and memory limits per run; floods bounded by call budgets. | SR-8 |
+| Elevation | Escape via foreign-function or subprocess tricks | The sandbox has no foreign-function or process machinery to call; the only remaining risk is a flaw in the sandbox engine itself (RR-1). | SR-7 |
+| Elevation / disclosure | Trick the door into over-reaching | The door exposes one function and re-derives the real target from the capId through the broker, never from text the guest supplies. | SR-22 |
 
-### TB2a — Sandbox engine config and supply chain
+### TB2a — the sandbox engine's configuration and supply chain
 
-| | Threat | Mitigation | SR |
+| | Threat | Defence | SR |
 |---|---|---|---|
-| **T** | Config grants a WASI capability and breaks the seal | Least-privilege config fixed by the runtime, not guest-influenced, checked fail-closed at startup (ADR-019) | SR-20 |
-| **T** | Tampered artefact or malicious crate | Pinned, lockfiled, digest-verified before instantiation; no dynamic load; `cargo audit`/`cargo deny`; signed installer (ADR-018 / ADR-022 / ADR-023) | SR-21 |
+| Tampering | A configuration mistake grants the sandbox a dangerous capability and breaks the seal | The sandbox configuration is least-privilege, fixed by the trusted code (the guest cannot influence it), and re-checked fail-closed at startup. | SR-20 |
+| Tampering | A swapped build or a malicious dependency | The build and its whole dependency tree are pinned, fingerprint-checked before they run (including the Windows-only dependencies), and never loaded dynamically; an automated check rejects known-bad dependencies. | SR-21 |
 
-### TB3 — Sandbox engine → Identity Broker (Z3)
+### TB3 — the sandbox engine reaches the broker
 
-| | Threat | Mitigation | SR |
+| | Threat | Defence | SR |
 |---|---|---|---|
-| **I** | Get a token sent back into the sandbox | The broker makes the call itself; only sanitised JSON returns; tokens never leave Z3 (ADR-010) | SR-4 |
-| **E** | A breached sandbox exceeds its grant | The broker independently re-checks cap/allowlist/budgets, and Z1r holds no tokens — a breach is a local foothold, not theft (SR-22) | SR-22 |
+| Information disclosure | Get a credential sent back into the sandbox | The broker makes the call itself and returns only sanitised data; no credential — sign-in token or static key — ever leaves the broker. | SR-4 |
+| Elevation | A broken sandbox tries to exceed its grant | The broker independently re-checks the capId, the allow-list, the budgets, and the write gate, and holds no credentials of its own to steal — an escape is a local foothold, not a theft. | SR-22 |
 
-### TB4 — Identity Broker (Z3) → `obo-broker` (Zobo)
+### TB4 — the broker reaches the on-behalf-of broker. *Exchange style only.*
 
-| | Threat | Mitigation | SR |
+| | Threat | Defence | SR |
 |---|---|---|---|
-| **I** | A corporate token lands on the laptop | `obo-broker` exchanges server-side and never returns the token — only sanitised JSON (obo-broker ADR-007) | SR-4 |
-| **E** | Skip step-up on a sensitive write | The server replies with a step-up challenge (RFC 9470); the daemon prompts via its UI and retries once; never caller-asserted (ADR-025 / obo-broker ADR-014 / ADR-015) | SR-3 |
+| Information disclosure | A corporate token lands on the laptop | The company server does the swap and never returns the token — only sanitised data comes back. | SR-4 |
+| Elevation | Skip step-up on a risky write | The server answers with a step-up challenge; the daemon prompts the user and retries once. The caller can never claim step-up itself. | SR-3 |
 
-### TB5 — Identity Broker (Z3) → direct external APIs (ZX)
+### TB5 — the broker reaches external, keyed, or public APIs
+Covers *passthrough* (the user's own token), *api key* (a static key), and *none* (no credential).
 
-| | Threat | Mitigation | SR |
+| | Threat | Defence | SR |
 |---|---|---|---|
-| **S** | A redirect hands the Bearer to an attacker host | Cross-origin redirects not followed; `Authorization` never re-sent to a new host (ADR-007) | SR-6 |
-| **T** | Off-allowlist host, path, or method | Host + canonical path + method allowlist, fail-closed; for direct providers the daemon broker is the sole gate (A-7) | SR-6, SR-2 |
-| **I** | Token leaks through a response or error | Response sanitised (headers stripped, size-capped) and tagged untrusted (ADR-008 / ADR-017) | SR-4, SR-12 |
+| Spoofing | A redirect hands the credential to an attacker's host | Cross-host redirects are not followed; the credential is never re-sent to a new host. | SR-6 |
+| Tampering | An off-allow-list host, path, or method; an unintended write | Host, exact path, and method must all be on the allow-list, fail-closed; and every API rule is **read-only unless an administrator-signed policy allows it to write**. | SR-6, SR-2, SR-27 |
+| Information disclosure | A credential leaks through a response or error | Responses are sanitised (headers stripped, size-capped) and marked untrusted; the credential is attached by the broker and never echoed back. | SR-4, SR-12 |
+| Information disclosure | A static key is sent to the wrong host | A key is bound to one API rule's exact host, path, and method, and used only on that call; one key per rule. | SR-26 |
 
-### TB6 — User (ZU) → consent / sign-in screen (Zui). *New.*
-Approvals are decided by the daemon's own UI, so the agent cannot assert that the user said yes.
+### TB6 — the user reaches the approval / sign-in screen. *Desktop only.*
+Approvals are decided by the daemon's own screen, so the agent can never claim the user said yes. The server deployment has no human and therefore no TB6 — see TB10 and SR-27 for how permission is granted there.
 
-| | Threat | Mitigation | SR |
+| | Threat | Defence | SR |
 |---|---|---|---|
-| **S** | A client fakes a "consent satisfied" signal | Consent, sign-in, and step-up are rendered and decided by the daemon UI; the caller supplies no result (ADR-025) | SR-3 |
-| **S** | A client presents a misleading `client_label` (e.g. "Claude Code") so the user approves believing a trusted tool is asking | The dialog shows the full grant — host, methods, step-up, provider — and the user, not the label, decides; the displayed tool name is a client-asserted hint, not verified identity. Only a same-UID caller can do this (RR-2); the accepted residual is RR-5 | SR-25 |
-| **T** | Consent silently widens across sessions | Cached in memory per `(client, workspace)`, never persisted (A-2) | SR-2 |
-| **I** | Phished or forged sign-in | Authorization-code + PKCE on the daemon's local page; `id_token` audience-restricted to the broker | SR-1 |
-| — | A headless caller hits a sensitive write | Fails closed (`INTERACTION_UNAVAILABLE`) unless pre-consented or mocked (ADR-016 / ADR-025) | SR-3 |
+| Spoofing | A client fakes an "approved" signal | The daemon's own screen renders and decides sign-in, approval, and step-up; the caller supplies no result. | SR-3 |
+| Spoofing | A client shows a misleading tool name so the user approves thinking a trusted tool is asking | The dialog shows the real grant — host, methods, whether step-up applies, and which provider — and the user, not the displayed name, decides. The tool name is an unverified hint. Only a same-identity caller can do this (RR-2); the accepted residual is RR-5. | SR-25 |
+| Tampering | An approval silently widens across sessions | Remembered only in memory, per client-and-workspace, never written down. | SR-2 |
+| Information disclosure | A phished or forged sign-in | Sign-in happens on the daemon's own local page, and the resulting proof is locked so that only the broker will accept it. | SR-1 |
+| — | A headless caller hits a risky write | On the desktop it fails closed unless already approved or mocked. On the server, writes are permitted only by an administrator-signed policy (SR-27). | SR-3, SR-27 |
 
-### TB7 — `obo-broker` (Zobo) → sign-in service (ZIdP): RFC 8693 exchange
+### TB7 — the on-behalf-of broker reaches the sign-in service
 
-| | Threat | Mitigation | SR |
+| | Threat | Defence | SR |
 |---|---|---|---|
-| **S** | A forged `id_token` is presented | Issuer, signature (JWKS), and audience validated, then `iss`/`aud` independently re-checked (obo-broker ADR-004 / ADR-012) | SR-1 |
-| **I** | Stored corporate tokens disclosed | Encrypted under a pluggable key manager (obo-broker ADR-011 / ADR-018); never returned to the laptop | SR-4 |
+| Spoofing | A forged sign-in proof is presented | The issuer, the signature, and the intended audience are all validated, then re-checked independently. | SR-1 |
+| Information disclosure | Stored corporate tokens are disclosed | Encrypted under a managed key and never returned to the laptop. | SR-4 |
 
-### TB8 — Daemon → OS keychain (Z3b)
+### TB8 — the daemon reaches the OS keychain. *Desktop sign-in.*
 
-| | Threat | Mitigation | SR |
+| | Threat | Defence | SR |
 |---|---|---|---|
-| **T** | On-disk token cache tampered or poisoned | Read-only via the OS keychain / sign-in session; never copied into the sandbox | SR-10 |
+| Tampering | An on-disk token cache is tampered with | Read through the operating system's keychain / sign-in session only, and never copied into the sandbox. | SR-10 |
 
-### TB9 — Audit → SIEM
+### TB9 — audit records reach the audit destination
 
-| | Threat | Mitigation | SR |
+| | Threat | Defence | SR |
 |---|---|---|---|
-| **R** | Local log tampering hides what happened | The local `.jsonl` is best-effort; the SIEM export is authoritative — mandatory and fail-closed under real credentials (ADR-016) | SR-9, SR-18 |
-| **I** | The audit log leaks tokens or bodies | Stores sizes and a keyed-HMAC user id only; body-logging is off by default and refused under real credentials | SR-18 |
+| Repudiation | Local log tampering hides what happened | The local log is best-effort; the central audit export is the authoritative record and is required when real credentials are in use — without it the server falls back to mock-only. | SR-9, SR-18 |
+| Information disclosure | The audit log leaks credentials or bodies | It stores only sizes and a one-way hash of the user id; keys, tokens, and bodies are never logged, and verbose body-logging is off by default and refused under real credentials. | SR-18, SR-26 |
+
+### TB10 — the broker reaches the mounted secret files. *Server only; new.*
+On the server the static API keys (and the audit and admin-signing keys) live in read-only files the deployment mounts in. The broker reads each once at startup into memory; it is never re-read at runtime, never written anywhere else, never returned to the guest, and never logged.
+
+| | Threat | Defence | SR |
+|---|---|---|---|
+| Information disclosure | A static key sits at rest and a container intruder reads it | Keys are deployment-managed read-only files, scoped to one API rule, never copied to other storage, never logged or returned. A full container break-in that reads them is the operator-compromise case (A-11), bounded by the per-rule allow-list, call budgets, and key rotation (RR-6). | SR-26 |
+| Tampering | A swapped or poisoned key file | A key that cannot be read at startup fails closed; an API rule whose key is missing fails its calls closed rather than calling with no credential. | SR-26, SR-2 |
+| Elevation | An unsigned policy grants itself a writable or keyed rule | Policy changes are accepted only with a valid administrator signature; an unsigned or invalid change falls back to the shipped default, and writing is allowed only in a signed policy. | SR-25, SR-27 |
 
 ## 6. Security requirements
 
-**P0** = load-bearing (its failure breaks the core claim); **P1** = defence-in-depth. The **Rationale** column is the *why* — what an attacker gains if the requirement is absent; the **Boundaries** column lists where it is enforced (the STRIDE rows in §5), and §7 records how the design meets it.
+**P0** = load-bearing (its failure breaks the core promise); **P1** = defence-in-depth. *Why it matters* is what an attacker gains without it; *Boundaries* is where it is enforced (section 5).
 
-| ID | Pri | Requirement | Rationale | Boundaries |
+| ID | Pri | Requirement | Why it matters | Boundaries |
 |---|---|---|---|---|
-| **SR-1** | P0 | User identity is established via OIDC and the `id_token` is audience-restricted to the broker. The calling tool is never accepted as an authenticated principal — connections are authenticated only by peer-UID plus a per-launch connection token. | The agent is untrusted and may be driven by prompt injection; if the client could authenticate as the user, every other control could be bypassed by simply asking. Anchoring identity to a real human sign-in is the root of trust the rest depends on. | TB1, TB6, TB7 |
-| **SR-2** | P0 | Every outbound call is checked against the capability allowlist (host, path, method) by the daemon broker, and again server-side for token-exchange capabilities. If policy cannot load, deny everything; the only accepted overrides are administrator-signed. | Without a positive allowlist a compromised agent could reach any host or method a token happens to permit. Enforcing on both sides means neither a workstation nor a server compromise alone widens access, and fail-closed stops a missing policy from silently permitting more. | TB1, TB5, TB6 |
-| **SR-3** | P0 | Sensitive (write) capabilities require challenge-driven step-up. The proof that step-up was satisfied lives only inside the `id_token` / daemon-rendered flow and can never be asserted by the caller. | Writes are the highest-impact action and the prime target for a hijacked agent. A fresh human re-authentication the agent cannot forge or replay keeps one compromised run from making destructive or exfiltrating writes unnoticed. | TB1, TB4, TB6 |
-| **SR-4** | P0 | Raw tokens never enter the agent's code (Z0/Z1) or return to the client, and downstream corporate tokens never reach the laptop at all. | A single stolen token lets an attacker act as the user against real APIs. Keeping custody inside the broker — and corporate tokens entirely on the server — means even a full sandbox compromise yields no reusable credential. This is the central promise of the design. | TB1, TB3, TB4, TB5 |
-| **SR-5** | P0 | Capability handles (`capId`) are opaque, single-use, expire within five minutes, and are bound to one daemon instance. | The guest must be able to name an approved action without holding anything reusable. A short-lived, single-use, unguessable handle is worthless almost immediately if leaked, so the reference the guest holds is never a credential in disguise. | TB1, TB2 |
-| **SR-6** | P0 | Outbound paths are canonicalised and rejected on `..` traversal; host and method must be allowlisted; cross-origin redirects are not followed and `Authorization` is never forwarded to a new host. | These are the classic ways a vetted call becomes an unintended one — traversal to a forbidden resource, or a redirect that hands the Bearer to an attacker's host. Closing them stops the allowlist (SR-2) being trivially side-stepped. | TB1, TB2, TB5 |
-| **SR-7** | P0 | The guest has no socket, filesystem, or process capability whatsoever; its only path out is the single broker host import, so network egress is impossible by construction. | If untrusted code could open its own connection it could exfiltrate data directly, bypassing every token-custody control. Removing the capability — rather than filtering it — means there is no egress path to misconfigure, disable, or find a hole in. | TB2 |
-| **SR-8** | P1 | Each run and session is bounded by hard budgets: Wasmtime CPU fuel, a wall-clock epoch deadline, 512 MiB memory, and a cap on broker calls. | Untrusted code can loop forever, allocate without limit, or flood the broker. Runtime-enforced ceilings keep a hostile or buggy run from denying service to the user's machine or the backend. | TB1, TB2 |
-| **SR-9** | P1 | Every run and outbound call is appended to an audit record with a server-minted `run_id`, a keyed-HMAC user id, and the server-verified peer UID; the SIEM export is the authoritative record. The `client_label` is recorded as a client-asserted hint, not a server-verified identity — a same-UID caller can assert any label (RR-5), so the trail proves *which user* but not *which tool*. | When the agent is the adversary, non-repudiation matters: there must be a tamper-resistant account of what was done and under whose authority. A server-minted `run_id` ties one run's calls together and the keyed-HMAC user id binds them to the signed-in user; making the central SIEM copy authoritative means local tampering cannot erase the trail. | TB1, TB9 |
-| **SR-10** | P1 | The guest receives no host environment; its capabilities arrive only through the broker host import (never as host files); and its linear memory is dropped at the end of each run. | Secrets leak through ambient inputs — environment variables, stray files, or memory left from a previous run. Denying all of these closes side channels that could hand the guest something it was never granted. | TB2, TB8 |
-| **SR-12** | P1 | API responses are returned in a typed envelope marked untrusted and are never automatically fed back into the LLM. | Response bodies are attacker-influenced and are the carrier for prompt injection (RR-3). Tagging them untrusted and refusing to auto-refeed them stops a poisoned response from silently steering the agent's next action. | TB5 |
-| **SR-18** | P1 | The audit trail never contains tokens or request/response bodies — only sizes and a keyed-HMAC user id; verbose body-logging is off by default and refused under real credentials. | An audit log is no use as a control if it becomes a second place secrets leak. Storing only sizes and an irreversible user id keeps the trail forensically useful without turning it into a breach surface. | TB9 |
-| **SR-20** | P0 | The Wasmtime configuration is hardened to least privilege, fixed by the runtime (never guest-influenced), and validated fail-closed at startup; no ambient WASI capabilities are granted. | The sandbox is only as strong as its configuration; a single accidental WASI grant collapses SR-7. Fixing the config in trusted code and checking it at startup makes the seal a verified property, not an assumption. | TB2a |
-| **SR-21** | P0 | The RustPython/WASM artefact and dependency tree are pinned, digest-verified before instantiation, and dependency-gated; nothing is loaded dynamically and the installer is signed. | A swapped interpreter or malicious dependency would run with the sandbox's trust and could undermine every other control from the inside. Pinning, verifying, and signing make a tampered build detectable before it ever executes. | TB2a |
-| **SR-22** | P0 | The broker independently re-enforces authorisation — `capId`, allowlist, budgets — treating the sandbox engine as untrusted, so a runtime or shim escape can neither exceed the granted set nor steal a token. | The Wasmtime seal (SR-7) is the only isolation boundary, so the design must survive its failure. Re-checking at the broker, where the runtime sees no tokens, turns an escape into a contained local foothold rather than a breach — this is what bounds RR-1. | TB2, TB3 |
-| **SR-24** | P0 | The client↔daemon boundary authenticates the peer (UID + per-launch connection token) and confines even a same-UID process that connects to the same consent, allowlist, budgets, and audit as any client. Confirmed by a dedicated pen test. | The long-lived daemon is a new, always-available target any same-UID program can reach (TB1) — a surface the extension model never had. Connecting must buy no more authority than the user already holds; this is load-bearing enough to warrant its own pen test (RR-2). | TB1 |
-| **SR-25** | P0 | A workspace may override the shipped policy only with an administrator-signed manifest; unsigned or invalid overrides are rejected to the shipped default, and the consent dialog shows the host, methods, step-up, and provider. | Per-project policy is a tempting injection point — a malicious repo could ship a manifest that widens its own access. Requiring an admin signature, and showing the user exactly what is granted, keeps control of the allowlist with administrators and the user, not the workspace. | TB1, TB6 |
+| **SR-1** | P0 | For the sign-in-based styles, the user's identity comes from a real sign-in, and the resulting proof is restricted so only the broker accepts it. The calling tool is never accepted as a user — connections are identified only by the operating-system identity behind them plus the connection token. | If the client could authenticate as the user, every other control could be bypassed just by asking. A real human sign-in is the root of trust the rest depends on. | TB1, TB6, TB7 |
+| **SR-2** | P0 | Every outbound call is checked against the allow-list (host, path, method) by the broker, and a second time on the company server for exchange calls. If the policy cannot load, deny everything; the only accepted overrides are administrator-signed. | Without a positive allow-list a compromised agent could reach anything a credential happens to permit. Checking both sides, and failing closed, stops one compromise or a missing policy from widening access. | TB1, TB5, TB6, TB10 |
+| **SR-3** | P0 | Risky writes require a fresh human re-authentication where a human exists, and the proof of it can never be claimed by the caller. With no human (server), step-up does not apply and is rejected; writes are gated by SR-27 instead. | Writes are the highest-impact action and the prime target for a hijacked agent. A re-auth the agent cannot forge — or, headless, an administrator's signature — keeps one bad run from making destructive writes. | TB1, TB4, TB6 |
+| **SR-4** | P0 | Raw credentials never enter the agent's code or return to the client, and corporate tokens never reach the laptop at all. | One stolen credential lets an attacker act as the principal against real APIs. Keeping custody in the broker — and corporate tokens entirely on the server — means even a full sandbox break yields nothing reusable. This is the central promise. | TB1, TB3, TB4, TB5, TB10 |
+| **SR-5** | P0 | The handles the guest holds are opaque, single-use, expire within five minutes, and are tied to one running daemon. | A short-lived single-use unguessable handle is worthless almost at once if leaked — what the guest holds is never a credential in disguise. | TB1, TB2 |
+| **SR-6** | P0 | Outbound paths are normalised and rejected on `..`; host and method must be allow-listed; cross-host redirects are not followed and the credential is never sent to a new host. | These are the classic ways a vetted call becomes an unintended one — traversal to a forbidden resource, or a redirect that hands the credential to an attacker. | TB1, TB2, TB5 |
+| **SR-7** | P0 | The guest has no socket, filesystem, or process capability; its only way out is the single broker door, so it cannot reach the network on its own. | If untrusted code could open its own connection it could send data out directly, around every custody control. Removing the capability leaves no egress path to misconfigure. | TB2 |
+| **SR-8** | P1 | Each run and session is bounded by hard limits: CPU, wall-clock, memory, and a cap on broker calls. | Untrusted code can loop forever, allocate without limit, or flood the broker; runtime ceilings stop one run denying service. | TB1, TB2 |
+| **SR-9** | P1 | Every run and call is recorded with a server-generated run id, a one-way hash of the user id (or a fixed service identity when headless), and the operating-system-verified caller identity; the central export is authoritative. The tool name is an unverified hint. | When the agent is the attacker, a tamper-resistant account of what was done, and under whose authority, is essential; a central copy cannot be erased by local tampering. | TB1, TB9 |
+| **SR-10** | P1 | The guest gets no host environment; its capabilities arrive only through the broker door (never as host files); its memory is wiped at the end of each run. | Secrets leak through stray inputs — environment values, files, leftover memory. Denying all of them closes those side channels. | TB2, TB8, TB10 |
+| **SR-12** | P1 | API responses come back in a typed wrapper marked untrusted and are never automatically fed back into the model. | Response bodies are attacker-influenced and the main carrier for prompt injection (RR-3); refusing to auto-feed them stops a poisoned response steering the next action. | TB5 |
+| **SR-18** | P1 | The audit trail never contains credentials or bodies — only sizes and a one-way hash of the user id; verbose body-logging is off by default and refused under real credentials. | An audit log is useless as a control if it becomes a second place secrets leak. | TB9, TB10 |
+| **SR-20** | P0 | The sandbox configuration is least-privilege, fixed by the trusted code, and re-checked fail-closed at startup; no ambient capabilities are granted. | The sandbox is only as strong as its configuration; one accidental grant collapses SR-7. Fixing it in trusted code makes the seal a checked property, not an assumption. | TB2a |
+| **SR-21** | P0 | The sandbox build and its whole dependency tree are pinned, fingerprint-checked before they run, and dependency-gated (including the Windows-only dependencies); nothing is loaded dynamically. Signing the installer is a supported, optional step. | A swapped interpreter or a malicious dependency would run with the sandbox's trust and could undermine every other control from the inside. Pinning and verifying make a tampered build detectable before it runs. | TB2a |
+| **SR-22** | P0 | The broker independently re-enforces authorisation — the capId, the allow-list, the budgets, the write gate — treating the sandbox as untrusted, so an escape can neither exceed the grant nor steal a credential. | The sandbox seal is the only isolation boundary, so the design must survive its failure; re-checking where no credentials are visible turns an escape into a contained foothold. | TB2, TB3 |
+| **SR-24** | P0 | The client-to-daemon boundary identifies the caller through the operating system — the connecting user on macOS/Linux, the connecting client's security identifier on Windows (read by impersonation, never by a recyclable process-ID lookup) — plus the connection token, and confines even a same-identity caller to the same approvals or write gate, allow-list, budgets, and audit as any client. Confirmed by a dedicated penetration test on each platform. | The always-on daemon is a new, always-available target any same-identity program can reach. Connecting must buy no more authority than that identity already holds — load-bearing enough to warrant its own test. | TB1 |
+| **SR-25** | P0 | The shipped policy can be overridden only by an administrator-signed change; an unsigned or invalid one falls back to the shipped default, and (desktop) the approval dialog shows the host, methods, step-up, and provider being granted. | Per-project policy is a tempting injection point — a malicious repository could ship a policy widening its own access. A required signature keeps control of the allow-list with administrators. | TB1, TB6, TB10 |
+| **SR-26** | P0 *(server)* | Static API keys are deployment-managed read-only files, read once at startup into memory, scoped to one API rule's host/path/method, never written elsewhere, never logged or returned to the guest, and applied only by the broker; an unreadable key fails closed. | The server introduces static, long-lived secrets the desktop never had. Tight scoping, never-logged custody, and failing closed bound what a leaked or missing key can do; the at-rest exposure under a container break-in is RR-6. | TB5, TB9, TB10 |
+| **SR-27** | P0 | Every API rule is read-only (fetch only) unless an administrator-signed policy explicitly marks that rule as allowed to write; enforced when the policy loads and re-checked on every call. | With no human to approve a write, the administrator's signature is the substitute permission, and read-only-by-default ensures a careless or unsigned policy cannot silently enable destructive calls. | TB1, TB5, TB10 |
 
-## 7. Compliance — does the design satisfy its requirements?
+## 7. Does the design meet its requirements?
 
-Design completeness only: is each §6 control fully specified? It is not a claim about running code — none exists yet beyond a scaffold. **✅ Met** · **◑ Partial** (deferred or open) · **✗ Gap**.
+This section scores **design completeness** — is each control fully specified — not whether code is in production. A separate set of activities still has to be done before real credentials (section 7.1a): a sandbox-escape penetration test, the client-auth penetration test on each platform, and producing a signed production build. Code now exists and the automated checks on both Linux and Windows pass (build, lint, the integration suite with real supporting services, the dependency gate, and the Windows client-auth penetration test); a dedicated sandbox-escape test and a signed build remain.
 
-The verification *activities* — the RR-1 Wasmtime-escape pen test, the SR-24 client-auth pen test, and producing the SR-21 signed build — are not scored here; whether they have passed is tracked in §7.1a and §8.
-
-| Req | Pri | Status | How the design satisfies it |
+| Req | Pri | Status | How the design meets it |
 |---|---|---|---|
-| SR-1 | P0 | ✅ Met | The user signs in through the daemon's own local page using OIDC authorization-code flow with PKCE, and the resulting `id_token` is audience-restricted so only the broker will accept it. The calling tool is never treated as an identity — every connection is authenticated by the caller's OS user (peer-UID) plus a per-launch connection token. Server-side, `obo-broker` independently re-validates the token's issuer, signature, and audience (ADR-024; obo-broker ADR-004 / ADR-012). |
-| SR-2 | P0 | ✅ Met | Every outbound call is checked against the capability allowlist — host, path, and method — by the in-daemon broker, and for token-exchange capabilities `obo-broker` re-checks the same rules on the server. If the policy file cannot be loaded the broker denies everything (fail-closed), and the only overrides it accepts are administrator-signed (A-7, SR-25). |
-| SR-3 | P0 | ✅ Met | A sensitive write triggers step-up: `obo-broker` replies with an RFC 9470 challenge, the daemon's own UI asks the user to re-authenticate, and the daemon retries the call once. The "step-up satisfied" fact travels only inside the re-issued `id_token` / daemon-rendered flow, so a caller can never assert it (ADR-025; obo-broker ADR-014 / ADR-015). Binding the `id_token` to its sender to defeat replay is a separate, still-open decision (obo-broker SR-28, §7.1). |
-| SR-4 | P0 | ✅ Met | Real tokens never enter the agent's code or cross back to the client: the broker performs each HTTPS call itself and returns only sanitised JSON. Corporate tokens go further still — `obo-broker` exchanges and uses them entirely on the server and never returns them to the laptop (ADR-010; obo-broker ADR-007). |
-| SR-5 | P0 | ✅ Met | Rather than a credential, the guest is handed an opaque 128-bit handle (`capId`) that is single-use, expires within five minutes, and is bound to one daemon instance. Only the broker can resolve a handle to its real `{provider, host, method, expiry}`, so a leaked or guessed one is worthless (sandbox-daemon/02-architecture.md). |
-| SR-6 | P0 | ✅ Met | Before any outbound call the path is canonicalised and rejected if it escapes with `..`, and the host and method must both be on the allowlist. Redirects to a different origin are not followed and the `Authorization` header is never re-sent to a new host, so a token cannot be steered to an attacker's server (ADR-007). |
-| SR-7 | P0 | ✅ Met | The guest runs in WebAssembly with no socket, filesystem, or process capability granted at all, so it has no means to reach the network or spawn anything — egress is absent by construction, not filtered after the fact (ADR-013). Whether the Wasmtime engine *itself* can be escaped is a separate question, answered by the RR-1 pen test (§7.1a), not by this design row. |
-| SR-8 | P1 | ✅ Met | Each run and session is bounded by Wasmtime fuel (CPU), an epoch deadline (wall-clock), a 512 MiB linear-memory cap, and a limit on the number of broker calls — so neither runaway code nor a flood of requests can exhaust the host (ADR-019). |
-| SR-9 | P1 | ✅ Met | Every run and outbound call is appended to an audit record carrying a server-minted `run_id` (128-bit CSPRNG, bound to each capability at mint time — C13/C11), a keyed-HMAC user id, and the server-verified peer UID. The `client_label` is recorded too, but as a client-asserted hint: on the `mcp-stdio` path the socket peer is always `faradayd` itself, so the daemon cannot derive which tool spawned it — attribution to a *user* is trustworthy, attribution to a *tool* is not (RR-5). The local log is only a convenience copy; the authoritative record is the SIEM export, which is mandatory and fail-closed whenever real credentials are in use (ADR-016). |
-| SR-10 | P1 | ✅ Met | The guest is started with no host environment variables, its capabilities arrive solely through the single broker host import (never as host files), and its WebAssembly linear memory is discarded at the end of each run (§5 TB2 / TB8). |
-| SR-12 | P1 | ✅ Met (control) · RR-3 accepted | API responses are wrapped in a typed envelope marked untrusted and are never automatically fed back into the LLM; where a response shape is known, only the expected fields are read (ADR-008 / ADR-017). This bounds but cannot remove prompt injection, so the leftover is the knowingly accepted residual RR-3. |
-| SR-18 | P1 | ✅ Met | The audit trail records only sizes and a keyed-HMAC of the user id — never tokens or request/response bodies. Verbose body-logging exists for debugging but is off by default and refused outright under real credentials (ADR-016). |
-| SR-20 | P0 | ✅ Met | The Wasmtime configuration is hardened to least privilege, fixed by the runtime so the guest cannot influence it, and validated at startup with a fail-closed check; no ambient WASI capabilities are granted (ADR-019). |
-| SR-21 | P0 | ✅ Met | The RustPython/WASM artefact and the whole crate tree are pinned and lockfiled, content-digest-verified before instantiation, and never loaded dynamically or from the network; `cargo audit` / `cargo deny` gate dependencies and the service installer is signed (ADR-018 / ADR-022 / ADR-023). Actually producing that signed, reproducible build is the activity tracked in §7.1a. |
-| SR-22 | P0 | ✅ Met | The broker re-checks the `capId`, allowlist, and budgets for every request and treats the sandbox engine as untrusted for authorisation. Because the engine holds no tokens, even a full runtime or shim compromise yields only a local foothold — it cannot exceed the granted capabilities or steal a token. This is what contains the RR-1 engine-escape risk. |
-| SR-24 | P0 | ✅ Met (design) · test pending | The client↔daemon boundary authenticates the caller by peer-UID plus a per-launch connection token, and holds even a same-UID process that connects to the same consent, allowlist, budget, and audit as any other client (ADR-024). That this genuinely bounds a same-UID driver is confirmed by the dedicated client-auth pen test (RR-2, §7.1a), so the row is design-complete with its test still pending. |
-| SR-25 | P0 | ✅ Met | A workspace may override the shipped policy only with an administrator-signed manifest; an unsigned or invalid one is rejected and the shipped default is used (fail-closed). Before granting a capability, the consent dialog shows the user the host, the methods, whether step-up applies, and the provider (sandbox-daemon/11-policy-schema.md). |
+| SR-1 | P0 | ✅ Met | Sign-in happens on the daemon's own page for the sign-in-based styles, and the resulting proof is locked so that only the broker will accept it; the tool is never an identity — connections are identified only by operating-system identity plus the connection token. The static-key and no-credential styles have no user by design (A-3). |
+| SR-2 | P0 | ✅ Met | The broker checks host, path, and method on every call, and the company server re-checks for exchange calls; a policy that cannot load denies everything; only administrator-signed overrides are accepted. |
+| SR-3 | P0 | ✅ Met | A risky write triggers a step-up challenge and a daemon-rendered re-auth where a human exists; with no human it is rejected at load, and SR-27 is the substitute. |
+| SR-4 | P0 | ✅ Met | The broker makes each call itself and returns only sanitised data; corporate tokens stay on the company server; static keys stay in the broker and are applied by it alone. |
+| SR-5 | P0 | ✅ Met | The guest holds only an opaque single-use handle, valid five minutes, tied to one daemon; only the broker can turn it into a real target. |
+| SR-6 | P0 | ✅ Met | Paths are normalised and `..` rejected; host and method must be allow-listed; cross-host redirects are not followed and the credential is never re-sent to a new host. |
+| SR-7 | P0 | ✅ Met (design) · RR-1 test pending | The guest has no socket, filesystem, or process capability, so it cannot reach the network on its own. Whether the engine itself can be escaped is the RR-1 test. |
+| SR-8 | P1 | ✅ Met | CPU, wall-clock, memory, and broker-call limits per run and session. |
+| SR-9 | P1 | ✅ Met | A server-generated run id, a one-way hash of the user id (or a fixed service identity when headless), and the verified caller identity per call; the central export is authoritative. |
+| SR-10 | P1 | ✅ Met | No host environment; capabilities arrive only through the broker door; memory wiped per run. |
+| SR-12 | P1 | ✅ Met (control) · RR-3 accepted | Responses are wrapped, marked untrusted, and never auto-fed back; the leftover is the accepted prompt-injection residual RR-3. |
+| SR-18 | P1 | ✅ Met | Only sizes and a one-way hash of the user id are recorded; keys, tokens, and bodies never are; verbose logging is off by default and refused under real credentials. |
+| SR-20 | P0 | ✅ Met | A least-privilege sandbox configuration fixed by the trusted code and checked fail-closed at startup. |
+| SR-21 | P0 | ✅ Met | The build and its whole dependency tree are pinned, fingerprint-checked before running, dependency-gated (including the Windows-only dependencies), and never loaded dynamically. Installer signing is supported as an optional, off-by-default step — a complete design choice; actually producing the signed build is the activity in section 7.1a, and the unsigned-by-default first-run posture is the accepted residual RR-9. |
+| SR-22 | P0 | ✅ Met | The broker re-checks the handle, allow-list, budgets, and write gate and holds no credentials, so even a full sandbox break is a contained foothold. |
+| SR-24 | P0 | ✅ Met (design) · tests: Windows automated, Unix pending | The boundary identifies the caller through the operating system plus the connection token and confines a same-identity caller to the granted actions. The Windows client-auth penetration test runs automatically; the equivalent Unix one is still to be run (RR-2). |
+| SR-25 | P0 | ✅ Met | Overrides require a valid administrator signature; unsigned or invalid ones fall back to the default; the desktop approval dialog shows the full grant. |
+| SR-26 | P0 *(server)* | ✅ Met | Per-rule mounted-file keys read once at startup, scoped to one host/path/method, never persisted/logged/returned, failing closed when unreadable. |
+| SR-27 | P0 | ✅ Met | Read-only by default; writing needs an explicit administrator-signed mark on that rule; enforced at load and re-checked per call. |
 
 ### 7.1 Outstanding design items
+None at the requirement level — all controls are specified across both deployments. The one open *decision* in the wider system is whether to bind the inbound sign-in proof to its sender and cap its age; that lives in the on-behalf-of broker's own documentation.
 
-None here — all 17 requirements are fully specified. The one open *decision* in the wider system — whether to sender-bind the `id_token` (DPoP/mTLS) and cap its accepted age — lives in the `obo-broker` design as **SR-28** (`obo-broker/10-risks.md`, "Partial — deferred") and is scored there.
-
-### 7.1a To prove before production (tracked in §8)
-
-- **RR-1 — Wasmtime-escape pen test** (SR-7 / SR-22). The engine is the sole isolation boundary by choice (ADR-013); the assumption must be tested before real credentials. Until it passes: mock / non-sensitive only.
-- **SR-24 — client-auth pen test** (RR-2). Confirm a same-UID driver really is held to granted capabilities.
-- **SR-21 — the signed build.** Produce the reproducible, signed artefact the supply-chain rules describe.
+### 7.1a To prove before production
+- **The sandbox-escape penetration test (RR-1).** The sandbox engine is the only isolation boundary by choice; that assumption must be tested before real credentials. Until then: mock or non-sensitive only.
+- **The client-auth penetration test (SR-24 / RR-2).** The Windows test runs automatically; run the equivalent on Unix and confirm a same-identity driver really is held to the granted actions.
+- **The signed build (SR-21 / RR-9).** Produce the reproducible, signed installer for each platform; it is unsigned/ad-hoc by default today.
 
 ### 7.2 Verdict
-
-17 of 17 requirements fully specified; no gaps. The two new boundaries — TB1 (client↔daemon) and TB6 (user↔consent UI) — are each fully controlled (SR-24 / SR-1 / SR-25 and SR-3). Five residual risks carry named controls and bounded, accepted residuals; SR-12 carries an accepted prompt-injection residual by design.
-
-A complete design is not production readiness. Real credentials additionally require the §7.1a gates — the Wasmtime-escape and client-auth pen tests (named in §9) and the signed build. Until then the posture is: real credentials behind the passing tests, mock-only before.
+All controls are specified across the desktop and server deployments. The new boundaries — a client reaching the daemon (both platforms), the user at the approval screen (desktop), and the broker reading mounted secrets (server) — are each controlled. A complete design is not production readiness: real credentials additionally require the section 7.1a activities. Until then the posture is real credentials only behind the passing tests and a signed build, mock-only before.
 
 ## 8. Residual risks
 
-- **RR-1 — Wasmtime engine escape.** The engine is the sole isolation boundary, by choice, with no OS sandbox behind it (ADR-013). Contained: it holds no tokens and the broker re-enforces authorisation (SR-22), so an escape is a local foothold as the (undefended) user, not theft. Confirmed by a dedicated pen test before production.
-- **RR-2 — Same-UID local driver.** Another same-UID process can read the `0600` connection token and drive the daemon. Bounded: tokens never cross the socket, and consent + allowlist + budgets + audit hold it to granted capabilities — the user's own authority (ADR-002 / ADR-024). Confirmed by the SR-24 pen test. Eliminating it would need per-client OS-keychain-gated credentials (a `/spec` hardening option). The *tool-identity* attribution within this surface is itself spoofable — see RR-5.
-- **RR-3 — Prompt injection in agent-surfaced content.** Cannot be eliminated while the system's purpose is to return API data. Bounded by the untrusted-content envelope and no auto-refeed (ADR-008 / ADR-017). Owner named at Approval.
-- **RR-4 — In-run cross-capability exfiltration.** Within one consented, budgeted, audited run the agent can move data between two user-authorised capabilities. Bounded by step-up on externally-readable write sinks, plus budgets and audit (ADR-021).
-- **RR-5 — Client-asserted tool identity.** The `client_label` a client presents (the `mcp-stdio` front door sends `"mcp"`; a native client sends its own) is **not** server-verified — on the stdio MCP path the socket peer is always `faradayd` itself, so the daemon cannot derive which tool spawned it. Bounded: only a same-UID process can assert a label (the RR-2 surface), every action is still tied to the server-verified peer UID and a server-minted `run_id`, and the label changes no API access. Residual: cross-*tool* audit attribution and the consent dialog's displayed tool name are spoofable by a same-UID caller, and first-connect consent keys on the label so a new same-UID client can reuse a seen one. Attribution to a *user* is sound; attribution to a *tool* is advisory. Eliminating it needs the per-client OS-keychain-gated credentials named in RR-2.
+- **RR-1 — Sandbox engine escape.** The engine is the only isolation boundary, by choice, with no operating-system sandbox behind it. Contained: it holds no credentials and the broker re-enforces the rules, so an escape is a local foothold as the (already-undefended) identity, not a theft. Confirmed by a dedicated penetration test before production.
+- **RR-2 — A same-identity local driver.** Another process sharing the daemon's identity can read the connection token and drive the daemon. Bounded: credentials never cross the channel, and approval (or the write gate) plus the allow-list, budgets, and audit hold it to the granted actions — the identity's own authority. Confirmed by the SR-24 tests. Removing it entirely would need a per-client credential gated by the OS keychain.
+- **RR-3 — Prompt injection in returned content.** Cannot be removed while the system's purpose is to return API data. Bounded by the untrusted wrapper and never auto-feeding responses back. Owner named at approval.
+- **RR-4 — Moving data between two granted capabilities in one run.** Within one approved, budgeted, audited run the agent can move data between two capabilities the user already authorised. Bounded by step-up (desktop) or the write gate (server) on write destinations, plus budgets and audit.
+- **RR-5 — Unverified tool name.** The tool name a client presents is not verified — on the front-door path the connecting program is always the daemon's own front door, so the daemon cannot tell which tool launched it. Bounded: only a same-identity process can set a name, every action is still tied to the verified caller identity and a server-generated run id, and the name changes no API access. Residual: cross-tool audit attribution and the displayed tool name in the approval dialog are spoofable by a same-identity caller. Attribution to an *identity* is sound; to a *tool* it is advisory.
+- **RR-6 — A static key at rest (server).** With static keys the daemon holds long-lived secrets in mounted files and in memory for its lifetime; a full container break-in reads them. Bounded: each key is scoped to one allow-listed host/path/method, never logged or returned, call budgets cap the blast radius, and rotation is the deployment's job. This is the operator-compromise case; accepted for single-tenant controlled deployments. Owner named at approval.
+- **RR-7 — No-credential calls (server).** No-credential API rules reach public endpoints with no credential. Bounded: still allow-listed, read-only unless signed for write, budgeted, and audited; the policy author must list each endpoint explicitly. Residual: an agent can drive any listed public endpoint within budget — the authority the policy already grants.
+- **RR-8 — An over-broad signed write grant (server).** Because headless writes are permitted by signature rather than by a human, a careless signed policy could enable unintended writes. Bounded: read-only by default, an explicit per-rule write mark, a required signature, and every write still allow-listed and audited. The residual is administrative, not technical.
+- **RR-9 — Unsigned-installer first-run trust.** Installers ship unsigned/ad-hoc by default, so the operating system warns on first run and the install guidance trains users to override that warning. Bounded: documented as an interim posture for first-party/internal testing; signing is a supported step that turns on with no structural change once certificates exist. Accepted interim residual.
 
 ## 9. Coverage summary
 
-All nine boundaries pass a STRIDE pass; TB1 and TB6 are the material additions over the carried-forward WASM/broker/OBO model. The two controls requiring a pre-production pen test are RR-1 (engine escape, ADR-013) and RR-2 (client auth, ADR-024). Every residual risk has a specified control and a bounded residual; every P0 requirement maps to at least one boundary.
+Every boundary passes the six-way checklist across both deployments. The material additions over the earlier model are the three new boundaries: a client reaching the daemon (identified by OS user on Unix and by security identifier on Windows), the user at the approval screen (desktop), and the broker reading mounted secrets (server). The controls needing a pre-production penetration test are the sandbox escape (RR-1) and client auth (SR-24 / RR-2 — automated on Windows, pending on Unix); the outstanding build activity is the signed installer (SR-21 / RR-9). Every residual risk has a named control and a bounded, accepted residual; every load-bearing requirement maps to at least one boundary.
 
-> **Open design item:** sender-binding the inbound `id_token` (DPoP/mTLS) is the one deferred decision, on the `obo-broker` side (obo-broker SR-28).
+## 10. Downstream MCP mediation (ADR-034)
+
+This section extends the approved model to the daemon acting as an MCP *client* of allowlisted upstream MCP servers — distinct from its existing role as the inbound MCP *server* (ADR-028), which is unaffected. The decision is **accepted at design level ([ADR-034](../design/sandbox-daemon/09-decisions.md))**; the detailed mechanics (multi-part-result sanitisation, the `toolAllow` schema, per-argument constraints) are specified in `/spec`, and **no code exists yet** — sections 1–9 remain the implemented-and-tested baseline. The scope is **HTTP/SSE-transport downstream MCP servers only** — stdio-transport is explicitly out of scope (RR-10).
+
+**Why it fits the existing model.** A downstream MCP server reached over HTTPS is, to the broker, an external API on the allow-list (TB5): a credentialed `POST` to one allowlisted origin. Two deltas distinguish it, and TB11 below records only those. Everything else — credential custody (SR-4), the allow-list and fail-closed posture (SR-2), cross-host-redirect refusal (SR-6), audit (SR-9/SR-18), and the laptop-vs-server credential split (TB4/TB5/TB10) — carries over **unchanged**.
+
+### TB11 — the broker reaches a downstream MCP server. *The MCP analogue of TB5.*
+The request is a JSON-RPC `tools/call` rather than a REST verb-and-path, so the allow-list unit is **server origin + tool name** instead of host + path + method; and the response is **multi-part MCP content** (text, structured content, embedded resource, resource link, image) rather than a single body. The credential is attached by the broker to the HTTPS call exactly as in TB5 and never crosses into the guest.
+
+| | Threat | Defence | SR |
+|---|---|---|---|
+| Tampering | The agent calls a downstream tool that is not meant to be reachable | The capability lists an explicit `toolAllow` set; a tool not on it is rejected fail-closed. The server's own advertised `tools/list` is treated as data, never as the authorisation surface. | SR-2, SR-28 |
+| Information disclosure | A credential leaks through a multi-part MCP result or a resource link | Every result part comes back in the untrusted wrapper, size-capped, never auto-fed to the model; resource links and embedded-resource URIs are returned as data and never auto-dereferenced by the broker. The credential is attached by the broker and never echoed. | SR-4, SR-12, SR-28 |
+| Spoofing | A redirect hands the MCP credential to an attacker host | Cross-host redirects are not followed and the credential is never re-sent to a new host (same rule as TB5). | SR-6 |
+| Elevation | A swapped or compromised upstream advertises new tools to widen its reach | A new advertised tool changes nothing: only `toolAllow` entries are callable, and the allow-list is admin-signed (SR-25), so the upstream cannot widen its own grant. | SR-25, SR-28 |
+
+### Requirement
+
+| ID | Pri | Requirement | Why it matters | Boundaries |
+|---|---|---|---|---|
+| **SR-28** | P0 | A downstream MCP capability is reached over HTTPS only; the broker holds the credential and the guest never sees it; the callable surface is a static, admin-signed `toolAllow` set (never the server's advertised `tools/list`); every result part is returned in the untrusted wrapper, size-capped, never auto-fed to the model, and resource links are never auto-dereferenced. stdio-transport downstream MCP is not permitted (RR-10). | MCP servers are a growing class of credentialed upstreams; reaching them outside the broker leaks the credential (the SR-4 failure), and trusting a server-controlled tool list would hand the authorisation boundary to the upstream. | TB11 |
+
+### Residual
+
+- **RR-10 — stdio-transport downstream MCP deferred.** A downstream MCP server that speaks only stdio would require the daemon to spawn and supervise a native, OS-privileged child process outside any sandbox — reintroducing the ambient-authority surface ADR-013 removed, inside the credential-holding daemon. ADR-034 puts it out of scope. Bounded by exclusion: there is no stdio-spawn code path; a deployment needing such a server must front it with an HTTP transport or wait for a separate decision. Not a residual of a shipped control — a deliberate scope boundary.
+
+**Assumption extension (A-5).** For an MCP capability the allow-list lists the server origin and the permitted tool names; nothing not on the `toolAllow` set is reachable, the same fail-closed contract A-5 states for REST host/path/method.
