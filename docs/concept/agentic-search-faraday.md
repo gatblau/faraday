@@ -117,15 +117,58 @@ Mapped to the requirements above:
 
 | Requirement | How the design meets it |
 |---|---|
-| Reach many systems to answer one question | The AI writes one small program that makes all the calls in sequence, instead of pausing to think after every step. |
+| Reach many systems to answer one question | The AI writes a small program that makes the credentialed calls — freshness checks, fan-out reads, saving notes — in one run, instead of a separate trip for each. Steps that need the AI to read and judge content (summarising a document, weighing two sources) still return that content to the AI; for those, it is the broker, not the sandbox, that keeps the call safe. |
 | Act with each user's own permissions | The broker calls every system as that user. The intern's request gets the system's own "access denied"; existing permissions do the policing. |
 | Never let credentials reach the AI or its code | The credentials stay with the broker, outside the sandbox. A tricked program can't leak a credential it was never given. |
-| Limit booby-trapped documents | What a program reads back is marked untrusted and is not fed straight back to the AI to act on. This contains a hidden instruction in a wiki page; it does not remove the risk, which is why responses are kept at arm's length rather than trusted. |
+| Limit booby-trapped documents | What a program reads back is marked untrusted: the AI may read it to summarise, but it is not treated as instructions to act on. This blunts a hidden instruction in a wiki page; it does not remove the risk, which is why responses are kept at arm's length rather than trusted. |
 | Stay inside agreed limits | An administrator sets an approved list of systems and addresses; the program can reach those and nothing else. |
 | Show its work | Every call is written to an audit log — the trail of where each fact came from, which is also what lets the answer cite its sources. |
 
-In short, the sandbox keeps the AI's code from reaching anything directly, and the
-broker makes the calls on its behalf so no credential ever enters the sandbox.
+In short, the broker holds the credentials and makes every call on the AI's behalf, so
+no credential ever enters the sandbox — that is the part that carries agentic search.
+
+The sandbox earns its place for the **plumbing**: the freshness checks, the
+link-following, the fan-out reads, the saves — many credentialed calls that run start to
+finish without the AI needing to see the data in between. The **reasoning** steps are
+different: to summarise a document or resolve a contradiction, the AI has to read the
+content, so that content comes back to it and the broker is what keeps the call safe.
+Both run through the same one door; the sandbox does more for the first kind than the
+second.
+
+---
+
+## Why one program, not many round-trips
+
+There is a second reason to have the AI write one program, beyond safety: speed and
+focus.
+
+The other way to build this is to let the AI work one step at a time — call the wiki,
+stop and think, call the memory, stop and think, and so on. It works, but every "stop
+and think" is slow, and it carries a hidden cost: each result the AI sees stays in front
+of it for the rest of the job. By the end it is trying to reason with a desk covered in
+every page it pulled along the way — most of which it no longer needs.
+
+Writing one program avoids both problems for the routine work:
+
+- **Fewer stops.** The freshness checks, the look-ups, the fan-out reads, the saves all
+  run start to finish without the AI stopping to think between them. It thinks once to
+  write the program, not once per call.
+- **A clear desk.** The in-between results — date stamps, the dozen candidates a search
+  returned, the duplicates it threw away — stay inside the program. The AI gets back
+  only what it actually needs: the answer, or the one or two documents worth reading.
+  Its working memory stays small, which keeps it faster, cheaper, and less likely to
+  lose the thread among pages it never needed.
+
+A smaller desk is also a smaller target: a booby-trapped page that never enters the AI's
+view cannot whisper instructions to it.
+
+**Where this stops helping.** The gain is real when the in-between work can be done by
+plain rules — sort by date, keep the top few, drop duplicates — because the AI can write
+that logic without seeing the results first. When picking what matters needs judgement —
+*which* of these ten pages actually answers a subtle question — the AI has to read them,
+so they come back into view and the saving goes with them. The same line runs through
+all of it: the program does the routine plumbing; the AI does the reading and the
+judging.
 
 ---
 
