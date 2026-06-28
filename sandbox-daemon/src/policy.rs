@@ -4,12 +4,16 @@
 //! per-run budget + step-up requirement.
 
 use crate::errors::WireError;
-use crate::types::{AuthMode, KeyPlacement, ResolvedCapability, Session};
+use crate::types::{AuthMode, CapabilityKind, KeyPlacement, ResolvedCapability, Session};
 use serde::Deserialize;
 use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
 struct RawCapability {
+    /// Capability kind (ADR-034). `rest` (default) uses host/pathAllow/methods; `mcp` uses
+    /// serverUrl/toolAllow. The `load` validation enforces the kind/allowlist pairing.
+    #[serde(default)]
+    kind: CapabilityKind,
     /// Optional for `none` (server-mode, ADR-037); required for `exchange`/`passthrough`
     /// (enforced in `load`, since the pluggable provider set is not enumerable here).
     #[serde(default)]
@@ -18,10 +22,20 @@ struct RawCapability {
     audience: Option<String>,
     #[serde(default)]
     scopes: Vec<String>,
+    /// REST kind: the single allowlisted host. Defaulted so an `mcp` entry may omit it; the
+    /// kind validation requires it for `rest` and forbids it for `mcp`.
+    #[serde(default)]
     host: String,
-    #[serde(rename = "pathAllow")]
+    #[serde(rename = "pathAllow", default)]
     path_allow: Vec<String>,
+    #[serde(default)]
     methods: Vec<String>,
+    /// MCP kind (ADR-034): the single allowlisted downstream MCP server origin.
+    #[serde(rename = "serverUrl", default)]
+    server_url: Option<String>,
+    /// MCP kind (ADR-034): the permitted downstream tool names (the `toolAllow` set).
+    #[serde(rename = "toolAllow", default)]
+    tool_allow: Vec<String>,
     #[serde(rename = "requireStepUpAuth", default)]
     require_step_up: bool,
     /// `exchange` (default) routes via the obo-broker; `passthrough` forwards the
@@ -73,13 +87,7 @@ impl PolicyEngine {
 
         let mut caps = HashMap::new();
         for (id, c) in raw.capabilities {
-            let path_allow = c
-                .path_allow
-                .iter()
-                .map(|p| regex::Regex::new(p))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| WireError::new("CFG_INVALID", "pathAllow regex"))?;
-            // Server-mode validation (fail-closed):
+            // Shared auth-mode validation (fail-closed; applies to both kinds):
             // (1) exchange/passthrough require a provider (the auth plugin selector).
             if matches!(c.auth_mode, AuthMode::Exchange | AuthMode::Passthrough)
                 && c.provider.is_empty()
@@ -113,40 +121,108 @@ impl PolicyEngine {
                     "secretRef/keyPlacement only valid for api_key",
                 ));
             }
-            // (3) write gate: an unsafe method needs the explicit opt-in (ADR-039).
-            if !c.allow_write
-                && c.methods
-                    .iter()
-                    .any(|m| UNSAFE_METHODS.iter().any(|u| m.eq_ignore_ascii_case(u)))
-            {
-                return Err(WireError::new(
-                    "CFG_INVALID",
-                    "unsafe method requires allowWrite",
-                ));
-            }
-            caps.insert(
-                id.clone(),
-                ResolvedCapability {
-                    id,
-                    provider: c.provider,
-                    audience: c.audience,
-                    scopes: c.scopes,
-                    host: c.host,
-                    path_allow,
-                    methods: c.methods,
-                    require_step_up: c.require_step_up,
-                    auth_mode: c.auth_mode,
-                    allow_write: c.allow_write,
-                    secret_ref: c.secret_ref,
-                    key_placement: c.key_placement,
-                    // ADR-034: the manifest loaded here is the REST taxonomy; the `mcp`
-                    // kind's load + validation is the C4 mcp step. Default to REST so an
-                    // existing manifest's behaviour is unchanged.
-                    kind: crate::types::CapabilityKind::Rest,
-                    server_url: None,
-                    tool_allow: Vec::new(),
-                },
-            );
+
+            let resolved = match c.kind {
+                // ADR-034: an MCP capability uses serverUrl + toolAllow and forbids
+                // host/pathAllow/methods. Build + validate the mcp shape.
+                CapabilityKind::Mcp => {
+                    let server_url = c
+                        .server_url
+                        .ok_or_else(|| WireError::new("CFG_INVALID", "mcp requires serverUrl"))?;
+                    if c.tool_allow.is_empty() {
+                        return Err(WireError::new("CFG_INVALID", "mcp requires toolAllow"));
+                    }
+                    if !c.host.is_empty() || !c.path_allow.is_empty() || !c.methods.is_empty() {
+                        return Err(WireError::new(
+                            "CFG_INVALID",
+                            "mcp forbids host/pathAllow/methods",
+                        ));
+                    }
+                    if !is_valid_mcp_url(&server_url) {
+                        return Err(WireError::new(
+                            "CFG_INVALID",
+                            "mcp serverUrl must be https or a 127.0.0.1 loopback http origin",
+                        ));
+                    }
+                    // SPEC-GAP-1 (ADR-034): obo `exchange` is a server-side REST call and
+                    // cannot drive an MCP tools/call, so mcp + exchange is unsupported. A
+                    // future obo MCP path would lift this; rejected fail-closed for now.
+                    if matches!(c.auth_mode, AuthMode::Exchange) {
+                        return Err(WireError::new(
+                            "CFG_INVALID",
+                            "mcp does not support authMode=exchange",
+                        ));
+                    }
+                    ResolvedCapability {
+                        id: id.clone(),
+                        provider: c.provider,
+                        audience: c.audience,
+                        scopes: c.scopes,
+                        host: String::new(),
+                        path_allow: Vec::new(),
+                        methods: Vec::new(),
+                        require_step_up: c.require_step_up,
+                        auth_mode: c.auth_mode,
+                        allow_write: c.allow_write,
+                        secret_ref: c.secret_ref,
+                        key_placement: c.key_placement,
+                        kind: CapabilityKind::Mcp,
+                        server_url: Some(server_url),
+                        tool_allow: c.tool_allow,
+                    }
+                }
+                // The REST taxonomy: host/pathAllow/methods required, serverUrl/toolAllow
+                // forbidden; the write gate applies to its methods (ADR-039).
+                CapabilityKind::Rest => {
+                    if c.host.is_empty() || c.path_allow.is_empty() || c.methods.is_empty() {
+                        return Err(WireError::new(
+                            "CFG_INVALID",
+                            "rest requires host/pathAllow/methods",
+                        ));
+                    }
+                    if c.server_url.is_some() || !c.tool_allow.is_empty() {
+                        return Err(WireError::new(
+                            "CFG_INVALID",
+                            "rest forbids serverUrl/toolAllow",
+                        ));
+                    }
+                    let path_allow = c
+                        .path_allow
+                        .iter()
+                        .map(|p| regex::Regex::new(p))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| WireError::new("CFG_INVALID", "pathAllow regex"))?;
+                    // (3) write gate: an unsafe method needs the explicit opt-in (ADR-039).
+                    if !c.allow_write
+                        && c.methods
+                            .iter()
+                            .any(|m| UNSAFE_METHODS.iter().any(|u| m.eq_ignore_ascii_case(u)))
+                    {
+                        return Err(WireError::new(
+                            "CFG_INVALID",
+                            "unsafe method requires allowWrite",
+                        ));
+                    }
+                    ResolvedCapability {
+                        id: id.clone(),
+                        provider: c.provider,
+                        audience: c.audience,
+                        scopes: c.scopes,
+                        host: c.host,
+                        path_allow,
+                        methods: c.methods,
+                        require_step_up: c.require_step_up,
+                        auth_mode: c.auth_mode,
+                        allow_write: c.allow_write,
+                        secret_ref: c.secret_ref,
+                        key_placement: c.key_placement,
+                        kind: CapabilityKind::Rest,
+                        server_url: None,
+                        tool_allow: Vec::new(),
+                    }
+                }
+            };
+            caps.insert(id, resolved);
         }
         Ok(PolicyEngine { caps })
     }
@@ -203,6 +279,40 @@ impl PolicyEngine {
         // Step-up: the daemon raises it via the consent UI / relays the obo-broker 401;
         // the acr allowlist check is server-side (obo-broker ADR-014), not here.
         Ok(canon)
+    }
+
+    /// Authorise an MCP `tools/call` against a resolved capability (ADR-034): the tool must
+    /// be in the capability's `toolAllow` set (the server's advertised `tools/list` is never
+    /// the authorisation surface), and the per-run budget must not be exceeded. There is no
+    /// path or method to check — an MCP capability has neither.
+    pub fn authorise_tool(
+        &self,
+        cap: &ResolvedCapability,
+        tool: &str,
+        session: &Session,
+        max_per_run: u32,
+    ) -> Result<(), WireError> {
+        if !cap.tool_allow.iter().any(|t| t == tool) {
+            return Err(WireError::new("MCP_TOOL_DENIED", "tool not allowed"));
+        }
+        if session.calls_used + 1 > max_per_run {
+            return Err(WireError::new("RATE_LIMITED", "run budget exceeded"));
+        }
+        Ok(())
+    }
+}
+
+/// True for an `https` origin, or a `http://127.0.0.1[:port]` loopback origin (the ADR-032
+/// dev exception). Mirrors the policy-schema `serverUrl` pattern; a DNS name such as
+/// `127.0.0.1.evil.com` or `localhost` never qualifies, so plaintext can never reach a
+/// remote host. C17 re-checks this at call time (defence in depth).
+fn is_valid_mcp_url(raw: &str) -> bool {
+    if raw.starts_with("https://") {
+        return true;
+    }
+    match raw.strip_prefix("http://127.0.0.1") {
+        Some(rest) => rest.is_empty() || rest.starts_with('/') || rest.starts_with(':'),
+        None => false,
     }
 }
 
@@ -380,5 +490,92 @@ mod server_mode_tests {
             !c.path_allow.iter().any(|re| re.is_match("/breeds")),
             "only the exact /fact path is allowed, not an arbitrary one"
         );
+    }
+
+    // ---- ADR-034: mcp capability kind ----
+
+    fn session() -> Session {
+        Session {
+            client: crate::types::ClientIdentity {
+                principal: "0".into(),
+                client_label: String::new(),
+            },
+            workspace_id: String::new(),
+            consented: Default::default(),
+            calls_used: 0,
+        }
+    }
+
+    #[test]
+    fn mcp_capability_loads_with_server_url_and_tool_allow() {
+        let j = r#"{"capabilities":{"tickets.mcp":{"kind":"mcp","authMode":"passthrough","provider":"github","serverUrl":"https://mcp.example.com/mcp","toolAllow":["search_tickets","get_ticket"]}}}"#;
+        let p = load(j).expect("loads");
+        let c = p.resolve("tickets.mcp").expect("present");
+        assert!(matches!(c.kind, CapabilityKind::Mcp));
+        assert_eq!(c.server_url.as_deref(), Some("https://mcp.example.com/mcp"));
+        assert_eq!(c.tool_allow, vec!["search_tickets", "get_ticket"]);
+        assert!(c.host.is_empty() && c.methods.is_empty() && c.path_allow.is_empty());
+    }
+
+    #[test]
+    fn mcp_loopback_http_loads() {
+        let j = r#"{"capabilities":{"m":{"kind":"mcp","authMode":"none","serverUrl":"http://127.0.0.1:8080/mcp","toolAllow":["t"]}}}"#;
+        assert!(load(j).is_ok());
+    }
+
+    #[test]
+    fn mcp_without_tool_allow_is_rejected() {
+        let j = r#"{"capabilities":{"m":{"kind":"mcp","authMode":"none","serverUrl":"https://m.example.com/mcp","toolAllow":[]}}}"#;
+        assert_eq!(err_code(load(j)), "CFG_INVALID");
+    }
+
+    #[test]
+    fn mcp_carrying_host_is_rejected() {
+        let j = r#"{"capabilities":{"m":{"kind":"mcp","authMode":"none","serverUrl":"https://m.example.com/mcp","toolAllow":["t"],"host":"m.example.com"}}}"#;
+        assert_eq!(err_code(load(j)), "CFG_INVALID");
+    }
+
+    #[test]
+    fn mcp_remote_http_server_url_is_rejected() {
+        let j = r#"{"capabilities":{"m":{"kind":"mcp","authMode":"none","serverUrl":"http://mcp.example.com/mcp","toolAllow":["t"]}}}"#;
+        assert_eq!(err_code(load(j)), "CFG_INVALID");
+    }
+
+    #[test]
+    fn mcp_with_exchange_is_rejected() {
+        // SPEC-GAP-1: obo exchange cannot drive an MCP tools/call.
+        let j = r#"{"capabilities":{"m":{"kind":"mcp","authMode":"exchange","provider":"rfc8693","audience":"a://x","serverUrl":"https://m.example.com/mcp","toolAllow":["t"]}}}"#;
+        assert_eq!(err_code(load(j)), "CFG_INVALID");
+    }
+
+    #[test]
+    fn rest_carrying_tool_allow_is_rejected() {
+        let j = r#"{"capabilities":{"r":{"authMode":"none","host":"h","pathAllow":["^/x$"],"methods":["GET"],"toolAllow":["t"]}}}"#;
+        assert_eq!(err_code(load(j)), "CFG_INVALID");
+    }
+
+    #[test]
+    fn authorise_tool_allows_a_listed_tool_and_denies_others() {
+        let j = r#"{"capabilities":{"m":{"kind":"mcp","authMode":"none","serverUrl":"https://m.example.com/mcp","toolAllow":["search_tickets"]}}}"#;
+        let p = load(j).expect("loads");
+        let c = p.resolve("m").unwrap();
+        assert!(p
+            .authorise_tool(c, "search_tickets", &session(), u32::MAX)
+            .is_ok());
+        let denied = p
+            .authorise_tool(c, "delete_ticket", &session(), u32::MAX)
+            .expect_err("not in toolAllow");
+        assert_eq!(denied.code, "MCP_TOOL_DENIED");
+    }
+
+    #[test]
+    fn authorise_tool_enforces_the_run_budget() {
+        let j = r#"{"capabilities":{"m":{"kind":"mcp","authMode":"none","serverUrl":"https://m.example.com/mcp","toolAllow":["t"]}}}"#;
+        let p = load(j).expect("loads");
+        let c = p.resolve("m").unwrap();
+        let mut s = session();
+        s.calls_used = 5;
+        let err = p.authorise_tool(c, "t", &s, 5).expect_err("over budget");
+        assert_eq!(err.code, "RATE_LIMITED");
     }
 }

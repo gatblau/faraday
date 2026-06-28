@@ -6,13 +6,16 @@
 
 use crate::audit::AuditLogger;
 use crate::downstream::{DownstreamClient, DownstreamError};
+use crate::mcp_upstream::{McpError, McpUpstreamClient};
 use crate::obo::{OboClient, OboError};
 use crate::policy::PolicyEngine;
 use crate::sanitize;
 use crate::types::{
-    AuditEntry, AuthMode, CapabilityHandle, ClientIdentity, Credential, KeyPlacement, Params,
-    Principal, ResolvedCapability, Session, UntrustedResponse,
+    AuditEntry, AuthMode, CapabilityHandle, CapabilityKind, ClientIdentity, Credential,
+    KeyPlacement, Params, Principal, ResolvedCapability, Session, UntrustedMcpResult,
+    UntrustedPart, UntrustedResponse,
 };
+use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -67,6 +70,10 @@ pub enum BrokerError {
     NoCredential,
     /// An `api_key` capability whose `secretRef` was not resolved at startup (ADR-036).
     KeyUnavailable,
+    /// MCP tool not in the capability's `toolAllow` set (ADR-034).
+    ToolDenied,
+    /// Downstream MCP upstream failure (timeout / unavailable / protocol), ADR-034.
+    Mcp(McpError),
 }
 
 impl BrokerError {
@@ -78,6 +85,8 @@ impl BrokerError {
             BrokerError::Downstream(e) => e.code(),
             BrokerError::NoCredential => "IDP_UNAVAILABLE",
             BrokerError::KeyUnavailable => "API_KEY_UNAVAILABLE",
+            BrokerError::ToolDenied => "MCP_TOOL_DENIED",
+            BrokerError::Mcp(e) => e.code(),
         }
     }
 }
@@ -130,6 +139,9 @@ pub struct IdentityBroker {
     creds: Arc<dyn CredentialSource>,
     max_response_bytes: usize,
     api_keys: Arc<dyn ApiKeyStore>,
+    /// Outbound MCP client (C17), used by `call_tool` (ADR-034). Optional: a daemon with
+    /// no mcp capability never wires it, and `call_tool` then fails closed.
+    mcp_upstream: Option<Arc<McpUpstreamClient>>,
 }
 
 impl IdentityBroker {
@@ -176,7 +188,16 @@ impl IdentityBroker {
             creds,
             max_response_bytes,
             api_keys,
+            mcp_upstream: None,
         }
+    }
+
+    /// Wire the outbound MCP client (C17) consumed by `call_tool` (ADR-034). A builder so
+    /// the existing `new`/`new_with_ttl` call sites are unchanged; a daemon with no mcp
+    /// capability simply never calls this and `call_tool` fails closed.
+    pub fn with_mcp_upstream(mut self, client: Arc<McpUpstreamClient>) -> Self {
+        self.mcp_upstream = Some(client);
+        self
     }
 
     /// Integration-test constructor that pins the capability TTL (e.g. a negative TTL
@@ -423,6 +444,154 @@ impl IdentityBroker {
         });
 
         Ok(resp)
+    }
+
+    /// Resolve `capId` (must be an Mcp capability), authorise the tool (C4 `authorise_tool`),
+    /// apply the credential, invoke the downstream MCP client (C17), sanitise (C5
+    /// `sanitize_mcp`), and audit (C3). The credential never enters the returned envelope
+    /// (ADR-034). `arguments` is the JSON the guest passed to `tools/call`.
+    pub async fn call_tool(
+        &self,
+        cap_id: &[u8; 16],
+        tool: &str,
+        arguments: &Value,
+    ) -> Result<UntrustedMcpResult, BrokerError> {
+        let mcp = self
+            .mcp_upstream
+            .as_ref()
+            .ok_or(BrokerError::Mcp(McpError::Unavailable))?;
+
+        // Look up + expiry check; clone out so the lock is not held across .await.
+        let (cap, principal, run_id, client_label) = {
+            let table = self.table.lock().unwrap();
+            let entry = table.get(cap_id).ok_or(BrokerError::CapInvalid)?;
+            if unix_now() >= entry.expires_at {
+                return Err(BrokerError::CapInvalid);
+            }
+            (
+                entry.cap.clone(),
+                entry.principal.clone(),
+                entry.run_id.clone(),
+                entry.client_label.clone(),
+            )
+        };
+
+        // `call_tool` is the Mcp entrypoint; a Rest capId routed here is a mismatch.
+        if !matches!(cap.kind, CapabilityKind::Mcp) {
+            return Err(BrokerError::CapInvalid);
+        }
+
+        // Authorise the tool against the static `toolAllow` set (C4). The per-run budget is
+        // the Controller's concern, so a permissive budget is given here.
+        let throwaway = Session {
+            client: ClientIdentity {
+                principal: "0".to_string(),
+                client_label: String::new(),
+            },
+            workspace_id: String::new(),
+            consented: Default::default(),
+            calls_used: 0,
+        };
+        self.policy
+            .authorise_tool(&cap, tool, &throwaway, u32::MAX)
+            .map_err(|_| BrokerError::ToolDenied)?;
+
+        let started = Instant::now();
+        let raw = match cap.auth_mode {
+            // Forward the user's OIDC access token as a Bearer to the MCP server.
+            AuthMode::Passthrough => {
+                let access = self.creds.access_token().ok_or(BrokerError::NoCredential)?;
+                let cred = Credential::Bearer(access);
+                mcp.call_tool(&cap, tool, arguments, |req| apply_credential(req, &cred))
+                    .await
+            }
+            // Apply the per-capability static key at its configured placement (ADR-036).
+            AuthMode::ApiKey => {
+                let secret_ref = cap.secret_ref.as_deref().unwrap_or_default();
+                let key = self
+                    .api_keys
+                    .lookup(secret_ref)
+                    .ok_or(BrokerError::KeyUnavailable)?;
+                let placement = cap
+                    .key_placement
+                    .as_ref()
+                    .ok_or(BrokerError::KeyUnavailable)?;
+                match placement {
+                    KeyPlacement::Header { name, scheme } => {
+                        let value = match scheme {
+                            Some(s) => format!("{s} {key}"),
+                            None => key.clone(),
+                        };
+                        let mut headers = HashMap::new();
+                        headers.insert(name.clone(), value);
+                        let cred = Credential::Headers(headers);
+                        mcp.call_tool(&cap, tool, arguments, |req| apply_credential(req, &cred))
+                            .await
+                    }
+                    KeyPlacement::Query { param } => {
+                        let p = param.clone();
+                        let k = key.clone();
+                        mcp.call_tool(&cap, tool, arguments, move |req| {
+                            req.url_mut().query_pairs_mut().append_pair(&p, &k);
+                        })
+                        .await
+                    }
+                }
+            }
+            // A public MCP server: no credential applied (ADR-037).
+            AuthMode::Unauthenticated => mcp.call_tool(&cap, tool, arguments, |_req| {}).await,
+            // SPEC-GAP-1 (ADR-034): mcp + exchange is rejected at load (C4); defensive here.
+            AuthMode::Exchange => return Err(BrokerError::CapInvalid),
+        }
+        .map_err(BrokerError::Mcp)?;
+
+        let sanitised = sanitize::sanitize_mcp(&raw, self.max_response_bytes);
+
+        // Audit: MCP semantics on the shared fields (host = server origin, path = tool,
+        // method = mcp.tools/call). Never a token or a body.
+        let host = cap
+            .server_url
+            .as_deref()
+            .map(server_host)
+            .unwrap_or_default();
+        let response_bytes = sanitised.parts.iter().map(part_len).sum::<usize>() as u64;
+        let request_bytes = serde_json::to_vec(arguments).map(|v| v.len()).unwrap_or(0) as u64;
+        self.audit.record(AuditEntry {
+            timestamp: unix_now(),
+            run_id,
+            user_hmac: self.audit.user_hmac(&principal.subject),
+            client_label,
+            provider: cap.provider.clone(),
+            capability_id: cap.id.clone(),
+            method: "mcp.tools/call".to_string(),
+            host,
+            path: tool.to_string(),
+            status_code: 200,
+            request_bytes,
+            response_bytes,
+            duration_ms: started.elapsed().as_millis() as u64,
+        });
+
+        Ok(sanitised)
+    }
+}
+
+/// The host of an MCP server origin, for the audit entry (e.g. `mcp.example.com`).
+fn server_host(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| url.to_string())
+}
+
+/// Byte length of an untrusted part's payload, for the audit size field.
+fn part_len(p: &UntrustedPart) -> usize {
+    match p {
+        UntrustedPart::Text { body, .. }
+        | UntrustedPart::Image { body, .. }
+        | UntrustedPart::EmbeddedResource { body, .. }
+        | UntrustedPart::Json { body } => body.len(),
+        UntrustedPart::ResourceLink { uri, .. } => uri.len(),
     }
 }
 

@@ -259,6 +259,43 @@ pub enum McpContentPart {
     },
 }
 
+/// The guest-facing untrusted envelope for an MCP `tools/call` (ADR-017/ADR-034) — C5/C11.
+/// Every part is untrusted and is never auto-fed to the model; a `ResourceLink` carries a
+/// uri only and is never dereferenced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntrustedMcpResult {
+    pub untrusted: bool,
+    pub is_error: bool,
+    pub parts: Vec<UntrustedPart>,
+    pub truncated: bool,
+}
+
+/// One part of the guest-facing untrusted MCP envelope (ADR-034) — C5. `Json` carries the
+/// tool's `structuredContent`; `ResourceLink` carries a uri only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UntrustedPart {
+    Text {
+        content_type: String,
+        body: Vec<u8>,
+    },
+    Json {
+        body: Vec<u8>,
+    },
+    Image {
+        mime_type: String,
+        body: Vec<u8>,
+    },
+    ResourceLink {
+        uri: String,
+        mime_type: Option<String>,
+    },
+    EmbeddedResource {
+        uri: String,
+        mime_type: Option<String>,
+        body: Vec<u8>,
+    },
+}
+
 /// One audit record per outbound call (sizes + keyed-HMAC id; never tokens/bodies) — C3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEntry {

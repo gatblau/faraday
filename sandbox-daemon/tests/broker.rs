@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use faradayd::audit::{AuditLogger, AuditSink};
-use faradayd::broker::{BrokerError, CredentialSource, IdentityBroker};
+use faradayd::broker::{ApiKeyStore, BrokerError, CredentialSource, IdentityBroker};
 use faradayd::downstream::DownstreamClient;
+use faradayd::mcp_upstream::McpUpstreamClient;
 use faradayd::obo::OboClient;
 use faradayd::policy::PolicyEngine;
 use faradayd::types::{AuditEntry, Principal};
@@ -244,4 +245,105 @@ async fn c11_routes_exchange_and_direct_expiry_and_stepup() {
         .await
         .expect_err("expired capId");
     assert_eq!(err, BrokerError::CapInvalid);
+}
+
+// ---- C11 call_tool: MCP routing (ADR-034) ----
+
+/// Build a broker over an mcp-only manifest, wired to the outbound MCP client (C17).
+fn mcp_broker(
+    server_url: &str,
+    sink: Arc<Mutex<Vec<AuditEntry>>>,
+) -> (IdentityBroker, PolicyEngine) {
+    let manifest = format!(
+        r#"{{"capabilities":{{
+            "tickets.mcp":{{"kind":"mcp","authMode":"none","serverUrl":"{server_url}","toolAllow":["search_tickets"]}}
+        }}}}"#
+    );
+    let policy = Arc::new(PolicyEngine::load(&manifest, None, &|_, _| true).unwrap());
+    let lookup = PolicyEngine::load(&manifest, None, &|_, _| true).unwrap();
+    let audit = Arc::new(AuditLogger::new(b"k".to_vec(), Box::new(VecSink(sink))));
+    let obo = Arc::new(OboClient::new("http://127.0.0.1:1".to_string()).unwrap());
+    let downstream =
+        Arc::new(DownstreamClient::new_plaintext(1_048_576, Duration::from_secs(5)).unwrap());
+    let creds: Arc<dyn CredentialSource> = Arc::new(StubCreds);
+    let mcp = Arc::new(McpUpstreamClient::new(1_048_576, Duration::from_secs(2), true).unwrap());
+    let b = IdentityBroker::new(
+        policy,
+        audit,
+        obo,
+        downstream,
+        creds,
+        1_048_576,
+        Arc::new(std::collections::HashMap::<String, String>::new()) as Arc<dyn ApiKeyStore>,
+    )
+    .with_mcp_upstream(mcp);
+    (b, lookup)
+}
+
+#[tokio::test]
+async fn c11_call_tool_routes_mcp_and_denies_unlisted_tool() {
+    let (_guard, base) = start_mockserver().await;
+    let admin = reqwest::Client::new();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let server_url = format!("{base}/mcp");
+    let (broker, lookup) = mcp_broker(&server_url, captured.clone());
+
+    let cap = lookup.resolve("tickets.mcp").unwrap().clone();
+    let handles = broker.mint_caps(&principal(), "run-mcp-1", "cli", &[cap]);
+    let cap_id = handles[0].cap_id;
+
+    // Program the MCP handshake: initialize → result; initialized → 202; tools/call → result.
+    put_expectation(
+        &admin,
+        &base,
+        serde_json::json!({
+            "httpRequest": {"method":"POST","path":"/mcp","body":{"type":"JSON","json":{"method":"initialize"},"matchType":"ONLY_MATCHING_FIELDS"}},
+            "httpResponse": {"statusCode":200,"headers":{"content-type":["application/json"]},
+                "body":"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{}}}"}
+        }),
+    )
+    .await;
+    put_expectation(
+        &admin,
+        &base,
+        serde_json::json!({
+            "httpRequest": {"method":"POST","path":"/mcp","body":{"type":"JSON","json":{"method":"notifications/initialized"},"matchType":"ONLY_MATCHING_FIELDS"}},
+            "httpResponse": {"statusCode":202}
+        }),
+    )
+    .await;
+    put_expectation(
+        &admin,
+        &base,
+        serde_json::json!({
+            "httpRequest": {"method":"POST","path":"/mcp","body":{"type":"JSON","json":{"method":"tools/call"},"matchType":"ONLY_MATCHING_FIELDS"}},
+            "httpResponse": {"statusCode":200,"headers":{"content-type":["application/json"]},
+                "body":"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}"}
+        }),
+    )
+    .await;
+
+    // Happy: the allowed tool routes to C17 and returns an untrusted envelope, no token.
+    let r = broker
+        .call_tool(&cap_id, "search_tickets", &serde_json::json!({"q":"open"}))
+        .await
+        .expect("mcp call_tool");
+    assert!(r.untrusted);
+    assert!(!r.is_error);
+    assert_eq!(r.parts.len(), 1);
+
+    // An audit entry was written with MCP semantics (method = mcp.tools/call, path = tool).
+    {
+        let entries = captured.lock().unwrap();
+        assert!(entries
+            .iter()
+            .any(|e| e.method == "mcp.tools/call" && e.path == "search_tickets"));
+    }
+
+    // A tool not in toolAllow is denied before any network call (C4 authorise_tool).
+    let err = broker
+        .call_tool(&cap_id, "delete_ticket", &serde_json::json!({}))
+        .await
+        .expect_err("tool not allowed");
+    assert_eq!(err.code(), "MCP_TOOL_DENIED");
 }

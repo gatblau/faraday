@@ -18,6 +18,7 @@ use faradayd::downstream::{DownstreamClient, DEFAULT_CALL_TIMEOUT};
 use faradayd::endpoint::Daemon;
 use faradayd::health::HealthCheck;
 use faradayd::interaction::{ConsentSummary, ConsentUI, InteractionSurface};
+use faradayd::mcp_upstream::McpUpstreamClient;
 use faradayd::obo::OboClient;
 use faradayd::policy::PolicyEngine;
 use faradayd::runtime::{Limits, SandboxRuntime};
@@ -305,15 +306,28 @@ async fn main() {
     }
     let api_keys: Arc<dyn ApiKeyStore> = Arc::new(api_key_map);
 
-    let broker = Arc::new(IdentityBroker::new(
-        policy.clone(),
-        audit,
-        obo,
-        downstream,
-        creds.clone() as Arc<dyn CredentialSource>,
-        config.response_max_bytes as usize,
-        api_keys,
-    ));
+    // C17 outbound MCP client (ADR-034): HTTPS-only with the ADR-032 loopback exception,
+    // same size cap as the REST downstream. Wired to the broker for `call_tool`.
+    let mcp_upstream = match McpUpstreamClient::new(
+        config.response_max_bytes,
+        DEFAULT_CALL_TIMEOUT,
+        config.allow_plaintext_loopback_egress,
+    ) {
+        Ok(c) => Arc::new(c),
+        Err(e) => die("mcp upstream client error", e),
+    };
+    let broker = Arc::new(
+        IdentityBroker::new(
+            policy.clone(),
+            audit,
+            obo,
+            downstream,
+            creds.clone() as Arc<dyn CredentialSource>,
+            config.response_max_bytes as usize,
+            api_keys,
+        )
+        .with_mcp_upstream(mcp_upstream),
+    );
 
     let runtime = match SandboxRuntime::new(
         &config.guest_artifact_digest,
