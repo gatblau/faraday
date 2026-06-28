@@ -139,6 +139,12 @@ impl PolicyEngine {
                     allow_write: c.allow_write,
                     secret_ref: c.secret_ref,
                     key_placement: c.key_placement,
+                    // ADR-034: the manifest loaded here is the REST taxonomy; the `mcp`
+                    // kind's load + validation is the C4 mcp step. Default to REST so an
+                    // existing manifest's behaviour is unchanged.
+                    kind: crate::types::CapabilityKind::Rest,
+                    server_url: None,
+                    tool_allow: Vec::new(),
                 },
             );
         }

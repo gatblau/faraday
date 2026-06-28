@@ -63,6 +63,17 @@ pub enum KeyPlacement {
     Query { param: String },
 }
 
+/// Selects a capability's allowlist shape — C4/C11/C17 (ADR-034).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CapabilityKind {
+    /// REST/HTTP API: host + path + method allowlist. Default; also when `kind` is omitted.
+    #[default]
+    Rest,
+    /// Downstream MCP server over HTTP/SSE: server origin + tool-name allowlist.
+    Mcp,
+}
+
 /// A capability-manifest entry after lookup — C4.
 #[derive(Debug, Clone)]
 pub struct ResolvedCapability {
@@ -83,6 +94,15 @@ pub struct ResolvedCapability {
     pub secret_ref: Option<String>,
     /// `api_key` mode (ADR-036): how the resolved key is attached. `Some` iff `ApiKey`.
     pub key_placement: Option<KeyPlacement>,
+    /// Capability kind (ADR-034). `Rest` uses `host`/`path_allow`/`methods`; `Mcp` uses
+    /// `server_url`/`tool_allow`. Defaults to `Rest`; a manifest entry without `kind` is REST.
+    pub kind: CapabilityKind,
+    /// `Mcp` kind (ADR-034): the single allowlisted downstream MCP server origin (HTTPS, or a
+    /// `127.0.0.1` loopback under the ADR-032 dev toggle). `Some` iff `kind == Mcp`.
+    pub server_url: Option<String>,
+    /// `Mcp` kind (ADR-034): the permitted downstream tool names (the `toolAllow` set).
+    /// Empty for a `Rest` capability.
+    pub tool_allow: Vec<String>,
 }
 
 /// The typed untrusted-content envelope returned to the guest (ADR-017) — C5.
@@ -202,6 +222,41 @@ pub struct RawResponse {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub truncated: bool,
+}
+
+/// A raw MCP `tools/call` result before sanitisation (C17 → C5), ADR-034. Carries the
+/// tool-level `is_error` flag, the content parts, optional structured content (raw JSON
+/// bytes), and whether the transport read hit the size cap. C5 (`sanitize_mcp`) maps this
+/// to the guest-facing untrusted envelope; the broker never auto-dereferences a link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolResult {
+    pub is_error: bool,
+    pub content: Vec<McpContentPart>,
+    pub structured_content: Option<Vec<u8>>,
+    pub truncated: bool,
+}
+
+/// One content part of a raw MCP tool result (C17 → C5), ADR-034. A `ResourceLink` carries
+/// a uri only — the broker never fetches it; an `EmbeddedResource` carries the inlined body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpContentPart {
+    Text {
+        content_type: String,
+        body: Vec<u8>,
+    },
+    Image {
+        mime_type: String,
+        body: Vec<u8>,
+    },
+    ResourceLink {
+        uri: String,
+        mime_type: Option<String>,
+    },
+    EmbeddedResource {
+        uri: String,
+        mime_type: Option<String>,
+        body: Vec<u8>,
+    },
 }
 
 /// One audit record per outbound call (sizes + keyed-HMAC id; never tokens/bodies) — C3.

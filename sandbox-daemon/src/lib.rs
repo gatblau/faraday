@@ -18,6 +18,7 @@ pub mod install; // ADR-031 installer helpers (MCP-config merge)
 pub mod interaction; // C8
 pub mod log; // XC3 structured logging + redaction
 pub mod mcp; // C16 MCP front door (`mcp-stdio` sub-mode)
+pub mod mcp_upstream; // C17 outbound MCP client (ADR-034)
 pub mod obo; // C9
 pub mod policy; // C4
 pub mod runtime; // C12

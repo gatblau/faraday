@@ -6,8 +6,9 @@
 use std::time::Duration;
 
 use faradayd::downstream::DownstreamClient;
+use faradayd::mcp_upstream::McpUpstreamClient;
 use faradayd::obo::{OboClient, OboError};
-use faradayd::types::{AuthMode, ResolvedCapability};
+use faradayd::types::{AuthMode, CapabilityKind, ResolvedCapability};
 use testcontainers::{core::IntoContainerPort, core::WaitFor, runners::AsyncRunner, GenericImage};
 
 const MOCKSERVER_IMAGE: &str = "mockserver/mockserver";
@@ -30,6 +31,30 @@ fn cap(host: &str) -> ResolvedCapability {
         allow_write: false,
         secret_ref: None,
         key_placement: None,
+        kind: CapabilityKind::Rest,
+        server_url: None,
+        tool_allow: vec![],
+    }
+}
+
+/// A minimal MCP-kind `ResolvedCapability` — `call_tool` reads `server_url`/`tool_allow`.
+fn mcp_cap(server_url: &str) -> ResolvedCapability {
+    ResolvedCapability {
+        id: "tickets.mcp".into(),
+        provider: "github".into(),
+        audience: None,
+        scopes: vec![],
+        host: String::new(),
+        path_allow: vec![],
+        methods: vec![],
+        require_step_up: false,
+        auth_mode: AuthMode::Passthrough,
+        allow_write: false,
+        secret_ref: None,
+        key_placement: None,
+        kind: CapabilityKind::Mcp,
+        server_url: Some(server_url.into()),
+        tool_allow: vec!["search_tickets".into(), "get_ticket".into()],
     }
 }
 
@@ -265,4 +290,105 @@ async fn c10_happy_redirect_timeout_and_cap() {
         .await
         .expect_err("timeout");
     assert_eq!(err.code(), "DOWNSTREAM_TIMEOUT");
+}
+
+// ---- C17 McpUpstreamClient (ADR-034) ----
+
+#[tokio::test]
+async fn c17_happy_call_unreachable_and_remote_refused() {
+    let (_guard, base) = start_mockserver().await;
+    let admin = reqwest::Client::new();
+    // base is http://127.0.0.1:<port>; the MCP endpoint is /mcp on the loopback stub.
+    let server_url = format!("{base}/mcp");
+    let cap = mcp_cap(&server_url);
+
+    // allow_plaintext_loopback = true so the 127.0.0.1 stub is reachable over http (ADR-032).
+    let client = McpUpstreamClient::new(65536, Duration::from_secs(1), true).unwrap();
+    let bearer = |req: &mut reqwest::Request| {
+        req.headers_mut().insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_static("Bearer downstream-token"),
+        );
+    };
+
+    // initialize → a well-formed JSON-RPC result + a session id header.
+    put_expectation(
+        &admin,
+        &base,
+        serde_json::json!({
+            "httpRequest": {
+                "method": "POST",
+                "path": "/mcp",
+                "body": {"type": "JSON", "json": {"method": "initialize"}, "matchType": "ONLY_MATCHING_FIELDS"}
+            },
+            "httpResponse": {
+                "statusCode": 200,
+                "headers": {"content-type": ["application/json"], "Mcp-Session-Id": ["sess-1"]},
+                "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{}}}"
+            }
+        }),
+    )
+    .await;
+    // notifications/initialized → 202 Accepted (no body).
+    put_expectation(
+        &admin,
+        &base,
+        serde_json::json!({
+            "httpRequest": {
+                "method": "POST",
+                "path": "/mcp",
+                "body": {"type": "JSON", "json": {"method": "notifications/initialized"}, "matchType": "ONLY_MATCHING_FIELDS"}
+            },
+            "httpResponse": {"statusCode": 202}
+        }),
+    )
+    .await;
+    // tools/call → a result carrying a text part.
+    put_expectation(
+        &admin,
+        &base,
+        serde_json::json!({
+            "httpRequest": {
+                "method": "POST",
+                "path": "/mcp",
+                "body": {"type": "JSON", "json": {"method": "tools/call"}, "matchType": "ONLY_MATCHING_FIELDS"}
+            },
+            "httpResponse": {
+                "statusCode": 200,
+                "headers": {"content-type": ["application/json"]},
+                "body": "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}"
+            }
+        }),
+    )
+    .await;
+
+    // Happy path: the allowed tool returns an McpToolResult with no token in it.
+    let r = client
+        .call_tool(
+            &cap,
+            "search_tickets",
+            &serde_json::json!({"q": "open"}),
+            bearer,
+        )
+        .await
+        .expect("happy tools/call");
+    assert!(!r.is_error);
+    assert_eq!(r.content.len(), 1);
+
+    // Unavailable: a dead port → MCP_UPSTREAM_UNAVAILABLE.
+    let dead = mcp_cap("http://127.0.0.1:1/mcp");
+    let err = client
+        .call_tool(&dead, "search_tickets", &serde_json::json!({}), bearer)
+        .await
+        .expect_err("unreachable server");
+    assert_eq!(err.code(), "MCP_UPSTREAM_UNAVAILABLE");
+
+    // Security: a remote http origin is refused before any network attempt — a forwarded
+    // credential can never leave the machine in cleartext.
+    let remote = mcp_cap("http://mcp.example.com/mcp");
+    let err = client
+        .call_tool(&remote, "search_tickets", &serde_json::json!({}), bearer)
+        .await
+        .expect_err("remote http refused");
+    assert_eq!(err.code(), "MCP_UPSTREAM_UNAVAILABLE");
 }

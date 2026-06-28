@@ -59,13 +59,18 @@ pub fn status_for(code: &str) -> u16 {
         "CAP_UNKNOWN"
         | "POLICY_PATH_DENIED"
         | "POLICY_METHOD_DENIED"
+        | "MCP_TOOL_DENIED"
         | "CAP_INVALID"
         | "INTERACTION_DENIED" => 403,
         "RATE_LIMITED" => 429,
         "INTERNAL" | "RUNTIME_ARTIFACT_MISMATCH" | "RUNTIME_LIMIT" => 500,
-        "EXCHANGE_FAILED" | "OBO_UNAVAILABLE" | "DOWNSTREAM_UNAVAILABLE" => 502,
+        "EXCHANGE_FAILED"
+        | "OBO_UNAVAILABLE"
+        | "DOWNSTREAM_UNAVAILABLE"
+        | "MCP_UPSTREAM_UNAVAILABLE"
+        | "MCP_PROTOCOL_ERROR" => 502,
         "IDP_UNAVAILABLE" => 503,
-        "DOWNSTREAM_TIMEOUT" => 504,
+        "DOWNSTREAM_TIMEOUT" | "MCP_UPSTREAM_TIMEOUT" => 504,
         _ => 500, // registry miss → INTERNAL (XC2)
     }
 }
