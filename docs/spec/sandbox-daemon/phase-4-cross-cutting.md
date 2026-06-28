@@ -22,7 +22,7 @@
 **Policy spec.**
 - **Client → daemon (new):** every connection authenticated by **peer-UID (Unix) / peer-SID (Windows named pipe, ADR-030) + connection token** (+ optional first-connect consent) — ClientAuth (C6), ADR-024. The client is never a trusted principal; only `{capId, verb, path}` and sanitised JSON cross the socket. **The `mcp-stdio` MCP front door (C16) is itself such a client** — it authenticates the same way and holds no tokens (ADR-028).
 - **User identity:** OIDC sign-in rendered by the daemon-owned UI (C8) as the **browser auth-code + PKCE loopback flow** (ADR-029, generic OIDC discovery — `PYS_OIDC_ISSUER`/`PYS_OIDC_CLIENT_ID`); the `id_token` is held only in the daemon (C11) and never reaches a client or the guest. No default IdP.
-- **Authorisation:** capability allowlist (host + canonical path + method) enforced by PolicyEngine (C4); per-session consent gates first use (C7/C8); admin-signed manifest only (ADR-021).
+- **Authorisation:** capability allowlist enforced by PolicyEngine (C4) — for a Rest capability host + canonical path + method, for an Mcp capability `serverUrl` + the `toolAllow` tool-name set (ADR-034, the advertised `tools/list` is never the authorisation surface); per-session consent gates first use (C7/C8); admin-signed manifest only (ADR-021).
 - **Pass-through resource audiencing (ADR-033):** for a `Passthrough` capability the daemon requests the capability's `audience` at sign-in (C13 collects, C8 requests) so the IdP-issued `access_token` is audienced for the **resource server**, which validates it before serving — the property that makes forwarding the user's token to a same-trust-domain provider safe (`broker.rs` pass-through note). Mechanism: Dex cross-client trusted-peer scope for the demo, RFC 8707 `resource` for generic IdPs. The `exchange` path audiences downstream tokens server-side instead (C9/obo-broker).
 - **Step-up:** challenge-driven (ADR-015/ADR-025) — on a `401 insufficient_user_authentication` from `obo-broker` (or a `requireStepUpAuth` capability), the daemon raises `StepUp` via C8, obtains a fresh `id_token` with the elevated `acr`, and retries once. Never caller-asserted.
 
@@ -48,15 +48,17 @@ Feature: Client authentication
 | VAL_ERR | 400 | ControlEndpoint |
 | POLICY_PATH_REJECTED | 400 | PolicyEngine |
 | TOKEN_INVALID / STEP_UP_REQUIRED / SIGN_IN_FAILED / INTERACTION_UNAVAILABLE | 401 | Broker / Policy / ConsentUI |
-| CAP_UNKNOWN / POLICY_PATH_DENIED / POLICY_METHOD_DENIED / CAP_INVALID / INTERACTION_DENIED | 403 | Policy / Broker / Controller |
+| CAP_UNKNOWN / POLICY_PATH_DENIED / POLICY_METHOD_DENIED / MCP_TOOL_DENIED / CAP_INVALID / INTERACTION_DENIED | 403 | Policy / Broker / Controller |
 | RATE_LIMITED | 429 | PolicyEngine / SessionManager |
 | INTERNAL / RUNTIME_ARTIFACT_MISMATCH / RUNTIME_LIMIT | 500 | various / Runtime |
-| EXCHANGE_FAILED / OBO_UNAVAILABLE / DOWNSTREAM_UNAVAILABLE | 502 | OboClient / DownstreamClient |
+| EXCHANGE_FAILED / OBO_UNAVAILABLE / DOWNSTREAM_UNAVAILABLE / MCP_UPSTREAM_UNAVAILABLE / MCP_PROTOCOL_ERROR | 502 | OboClient / DownstreamClient / McpUpstreamClient |
 | IDP_UNAVAILABLE | 503 | Broker |
-| DOWNSTREAM_TIMEOUT | 504 | DownstreamClient |
+| DOWNSTREAM_TIMEOUT / MCP_UPSTREAM_TIMEOUT | 504 | DownstreamClient / McpUpstreamClient |
 | CLIENT_UID_DENIED / CLIENT_TOKEN_DENIED / CLIENT_NOT_APPROVED | (connection refused) | ClientAuth |
 | CFG_* (the audit HMAC key is a `*_REF` resolved by Config — unresolved → `CFG_SECRET_UNRESOLVED`) | (startup fail-closed, non-zero exit) | Config (C1) |
 | control socket cannot bind securely | (startup io error → non-zero exit; no wire code) | ControlEndpoint (C14) |
+
+An MCP `tools/call` that returns a tool-level `isError=true` is **not** a `WireError`: it is surfaced to the guest as `UntrustedMcpResult.is_error=true` (ADR-034). Only transport/protocol failures of the MCP upstream map to the `MCP_UPSTREAM_*` / `MCP_PROTOCOL_ERROR` codes above.
 
 **Internal Logic.** `write(code, msg)` looks up the status, truncates `msg` to 200 chars, never includes upstream error text containing tokens; a recovery layer maps a panic to `500 INTERNAL` (logged server-side, never in the body).
 

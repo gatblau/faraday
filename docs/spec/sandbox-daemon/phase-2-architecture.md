@@ -46,15 +46,16 @@ Build order is the dependency DAG (leaves first). All components are Rust module
 | C8 | ConsentUI / InteractionBroker | `interaction` | 3 | Config | High |
 | C9 | OboClient (backend exchange) | `obo` | 3 | Config | Medium |
 | C10 | DownstreamClient (direct providers) | `downstream` | 3 | Config | Medium |
-| C11 | IdentityBroker (token vault, capability table, egress, OBO/direct, OIDC sign-in) | `broker` | 3 | Config, AuditLogger, PolicyEngine, ResponseSanitizer, OboClient, DownstreamClient, keychain | High |
+| C11 | IdentityBroker (token vault, capability table, egress, OBO/direct/MCP, OIDC sign-in) | `broker` | 3 | Config, AuditLogger, PolicyEngine, ResponseSanitizer, OboClient, DownstreamClient, McpUpstreamClient, keychain | High |
 | C12 | SandboxRuntime (Wasmtime + RustPython, single host import) | `runtime` | 3 | Config, IdentityBroker | High |
 | C13 | SandboxController (run lifecycle, capability bundle, redaction, interaction routing) | `controller` | 3 | IdentityBroker, SandboxRuntime, PolicyEngine, ConsentUI, SessionManager, AuditLogger | High |
 | C14 | ControlEndpoint (native-RPC listener; cross-platform UDS `0600` + peer-UID / named pipe + per-user-SID, ADR-030) | `endpoint` | 3 | ClientAuth, SessionManager, SandboxController | High |
 | C15 | HealthCheck (liveness/readiness over the control socket) | `health` | 4 (cross-cutting) | IdentityBroker (dep reachability) | Low |
 | C16 | McpFrontDoor (`faradayd mcp-stdio` sub-mode — MCP stdio server; untrusted client of C14, ADR-028) | `mcp` | 3 | (client of) ControlEndpoint over the control socket; the connection-token file | High |
+| C17 | McpUpstreamClient (outbound MCP **client** — JSON-RPC `tools/call` over HTTP/SSE to allowlisted downstream MCP servers, ADR-034) | `mcp_upstream` | 3 | Config | Medium |
 | — | `pysandbox_sdk` (guest Python module — contract surface) | `sdk/` (Python) | 3 | the single WASM host import (C12) | Low |
 
-DAG check: C1 has no deps; C2,C3,C4,C5,C6,C7,C8,C9,C10 depend only on C1 (+ external); C11 on C1/C3/C4/C5/C9/C10; C12 on C1/C11; C13 on C11/C12/C4/C8/C7/C3; C14 on C6/C7/C13; C15 on C11; **C16 is a separate process (the `mcp-stdio` sub-mode) that connects to C14 as an ordinary authenticated client — no in-process dependency, so it does not affect the build DAG**. No cycles (leaves → C11 → C12 → C13 → C14).
+DAG check: C1 has no deps; C2,C3,C4,C5,C6,C7,C8,C9,C10,C17 depend only on C1 (+ external); C11 on C1/C3/C4/C5/C9/C10/C17; C12 on C1/C11; C13 on C11/C12/C4/C8/C7/C3; C14 on C6/C7/C13; C15 on C11; **C16 is a separate process (the `mcp-stdio` sub-mode) that connects to C14 as an ordinary authenticated client — no in-process dependency, so it does not affect the build DAG**. No cycles (leaves → C11 → C12 → C13 → C14). C17 (the outbound MCP client) is a leaf alongside C10, consumed by C11 — not to be confused with C16 (the inbound MCP front door).
 
 ## 2C — Shared Types Catalogue
 
@@ -83,6 +84,7 @@ pub struct RunResult {
 // DryRunResult — planned calls only (static capability resolution, ADR-009).
 pub struct DryRunResult { pub planned_calls: Vec<CallSummary> }
 // CallSummary — names a call; carries no body and no token.
+// For an Mcp call (ADR-034): host = the server origin host, path = the tool name, method = "mcp.tools/call".
 pub struct CallSummary { pub provider: String, pub host: String, pub path: String, pub method: String, pub status: Option<u16> }
 // Used by: SandboxController (C13), ControlEndpoint (C14).
 
@@ -99,14 +101,24 @@ pub struct ClientIdentity { pub principal: String, pub client_label: String /* e
 pub struct Session { pub client: ClientIdentity, pub workspace_id: String, pub consented: std::collections::HashSet<String>, pub calls_used: u32 }
 // Used by: SessionManager (C7), SandboxController (C13).
 
-// ResolvedCapability — a manifest entry after lookup.
+// CapabilityKind — selects the allowlist shape (ADR-034).
+pub enum CapabilityKind { Rest, Mcp }
+// Used by: PolicyEngine (C4), IdentityBroker (C11), SandboxController (C13), ConsentUI (C8).
+
+// ResolvedCapability — a manifest entry after lookup. The kind selects which allowlist
+// fields are populated: Rest → host/path_allow/methods; Mcp → server_url/tool_allow (ADR-034).
 pub struct ResolvedCapability {
-    pub id: String, pub provider: String,   // e.g. "rfc8693" (OBO) | "github" (direct)
+    pub id: String, pub kind: CapabilityKind,
+    pub provider: String,                    // e.g. "rfc8693" (OBO) | "github" (direct)
     pub audience: Option<String>, pub scopes: Vec<String>,
+    // Rest kind (empty/None for Mcp):
     pub host: String, pub path_allow: Vec<regex::Regex>, pub methods: Vec<String>,
+    // Mcp kind (empty/None for Rest):
+    pub server_url: Option<String>,          // single allowlisted MCP server origin (HTTPS / loopback)
+    pub tool_allow: Vec<String>,             // permitted downstream tool names (the toolAllow set)
     pub require_step_up: bool,
 }
-// Used by: PolicyEngine (C4), IdentityBroker (C11), SandboxController (C13).
+// Used by: PolicyEngine (C4), IdentityBroker (C11), SandboxController (C13), McpUpstreamClient (C17).
 
 // CapabilityHandle — opaque per-run handle bound to this daemon instance.
 pub struct CapabilityHandle { pub cap_id: [u8; 16], pub capability_id: String, pub expires_at: i64 }
@@ -116,9 +128,27 @@ pub struct CapabilityHandle { pub cap_id: [u8; 16], pub capability_id: String, p
 pub enum Credential { Bearer(String), Headers(std::collections::HashMap<String,String>) }
 // Used by: IdentityBroker (C11), OboClient (C9), DownstreamClient (C10).
 
-// UntrustedResponse — the typed envelope returned to the guest (ADR-017).
+// UntrustedResponse — the typed envelope returned to the guest for a REST call (ADR-017).
 pub struct UntrustedResponse { pub untrusted: bool /* always true */, pub status: u16, pub content_type: String, pub body: Vec<u8>, pub truncated: bool }
 // Used by: ResponseSanitizer (C5), SandboxRuntime (C12).
+
+// UntrustedMcpResult — the typed envelope returned to the guest for an MCP tools/call (ADR-017/ADR-034).
+// Every part is untrusted and is NEVER auto-fed to the model; resource links carry a uri only and the
+// broker never auto-dereferences them (a follow-up fetch would be a separate, separately-authorised call).
+pub struct UntrustedMcpResult {
+    pub untrusted: bool /* always true */,
+    pub is_error: bool,                      // the MCP tools/call result `isError` flag (a tool-level error, not a transport error)
+    pub parts: Vec<UntrustedPart>,
+    pub truncated: bool,                     // true if any part or the aggregate exceeded responseMaxBytes
+}
+pub enum UntrustedPart {
+    Text { content_type: String, body: Vec<u8> },          // text content
+    Json { body: Vec<u8> },                                // structuredContent / structured tool output
+    Image { mime_type: String, body: Vec<u8> },            // size-capped binary
+    ResourceLink { uri: String, mime_type: Option<String> },               // link only — NOT dereferenced
+    EmbeddedResource { uri: String, mime_type: Option<String>, body: Vec<u8> }, // inlined resource, size-capped
+}
+// Used by: ResponseSanitizer (C5), McpUpstreamClient (C17), SandboxRuntime (C12).
 
 // InteractionRequired — daemon→client challenge (ADR-025); never client-asserted satisfied.
 pub enum InteractionRequired {
@@ -126,12 +156,15 @@ pub enum InteractionRequired {
     // sign-in requests an access token audienced for each resource (ADR-033). Empty when no
     // capability sets `audience`.
     SignIn { issuer: String, audiences: Vec<String> },
-    Consent { capability_id: String, host: String, methods: Vec<String>, provider: String, require_step_up: bool },
+    // For a Rest capability the dialog shows host + methods; for an Mcp capability (ADR-034) it shows
+    // server_url + tools (the toolAllow set). The populated pair matches the capability kind.
+    Consent { capability_id: String, host: String, methods: Vec<String>, server_url: Option<String>, tools: Vec<String>, provider: String, require_step_up: bool },
     StepUp { acr_values: Vec<String>, max_age_secs: u64, audiences: Vec<String> },
 }
 // Used by: ConsentUI (C8), SandboxController (C13), ControlEndpoint (C14).
 
-// AuditEntry — one record per outbound call.
+// AuditEntry — one record per outbound call. For an Mcp call (ADR-034) the same fields carry MCP
+// semantics: host = the server origin host, path = the tool name, method = "mcp.tools/call".
 pub struct AuditEntry {
     pub timestamp: i64, pub run_id: String, pub user_hmac: String, pub client_label: String,
     pub provider: String, pub capability_id: String, pub method: String, pub host: String, pub path: String,

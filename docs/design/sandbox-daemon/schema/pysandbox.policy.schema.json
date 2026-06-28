@@ -24,8 +24,13 @@
     "capability": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["host", "pathAllow", "methods"],
       "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["rest", "mcp"],
+          "default": "rest",
+          "description": "Capability kind (ADR-034). `rest` (the default, also when omitted) mediates a REST/HTTP API by host + pathAllow + methods. `mcp` mediates a downstream MCP server over HTTP/SSE transport by serverUrl + toolAllow. The kind selects which allowlist fields are required and which are forbidden (see allOf). A capability omitting `kind` is `rest`, so manifests written before ADR-034 are unchanged."
+        },
         "provider": {
           "type": "string",
           "pattern": "^[a-z0-9][a-z0-9-]*$",
@@ -60,7 +65,20 @@
           "items": { "type": "string", "enum": ["GET", "POST", "PATCH", "PUT", "DELETE"] },
           "minItems": 1,
           "uniqueItems": true,
-          "description": "HTTP methods the broker permits for this capability. The pysandbox_sdk currently exposes get/post/patch/delete; PUT is accepted in policy for forward compatibility."
+          "description": "HTTP methods the broker permits for this capability. The pysandbox_sdk currently exposes get/post/patch/delete; PUT is accepted in policy for forward compatibility. REST kind only — forbidden on an `mcp` capability."
+        },
+        "serverUrl": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^(https://|http://127\\.0\\.0\\.1(:[0-9]+)?(/|$))",
+          "description": "MCP kind only (ADR-034): the single allowlisted downstream MCP server origin, reached over HTTP/SSE transport. The broker pins each JSON-RPC `tools/call` to this origin, does not auto-follow cross-origin redirects, and never re-sends the credential across a host boundary — the `host` rules of a REST capability, applied to the MCP transport. HTTPS only; the sole exception is a `http://127.0.0.1[:port]` loopback origin under the ADR-032 dev opt-in (`localhost` and any DNS name do not qualify). stdio transport is not expressible (threat-model RR-10)."
+        },
+        "toolAllow": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "MCP kind only (ADR-034): the exact downstream tool names the agent may call via `mcp.<capability-id>.call_tool(name, ...)`. A tool the server advertises through `tools/list` but absent from `toolAllow` is unreachable, fail-closed — the server's advertised list is never the authorisation surface. The allowlist is over tool names only; per-argument constraints are deferred (a future field extension, no schema break)."
         },
         "requireStepUpAuth": {
           "type": "boolean",
@@ -121,6 +139,21 @@
         }
       },
       "allOf": [
+        {
+          "$comment": "Capability kind (ADR-034): mcp uses serverUrl + toolAllow and forbids host/pathAllow/methods; rest (incl. omitted kind) uses host/pathAllow/methods and forbids serverUrl/toolAllow.",
+          "if": {
+            "properties": { "kind": { "const": "mcp" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["serverUrl", "toolAllow"],
+            "properties": { "host": false, "pathAllow": false, "methods": false }
+          },
+          "else": {
+            "required": ["host", "pathAllow", "methods"],
+            "properties": { "serverUrl": false, "toolAllow": false }
+          }
+        },
         {
           "$comment": "Token-exchange providers require an audience. One clause per token-exchange provider; extend as plugins are added.",
           "if": {

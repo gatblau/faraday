@@ -12,6 +12,7 @@ All components are Rust modules in one binary (HLD ADR-026). Each carries Public
 - [C8 ConsentUI](#c8-consentui) 
 - [C9 OboClient](#c9-oboclient) 
 - [C10 DownstreamClient](#c10-downstreamclient) 
+- [C17 McpUpstreamClient](#c17-mcpupstreamclient) 
 - [C11 IdentityBroker](#c11-identitybroker) 
 - [C12 SandboxRuntime](#c12-sandboxruntime) 
 - [C13 SandboxController](#c13-sandboxcontroller) 
@@ -109,12 +110,13 @@ Feature: AuditLogger
 ### C4 PolicyEngine
 **File:** `src/policy.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.1
 
-**Purpose.** Load the capability manifest fail-closed (admin-signed overrides only, ADR-021), resolve a `capabilityId` to a `ResolvedCapability`, and authorise a call: canonical-path/method/host allowlist + per-run/session budget + step-up requirement.
+**Purpose.** Load the capability manifest fail-closed (admin-signed overrides only, ADR-021), resolve a `capabilityId` to a `ResolvedCapability`, and authorise a call: for a Rest capability, canonical-path/method/host allowlist; for an Mcp capability (ADR-034), the `toolAllow` tool-name allowlist; both plus per-run/session budget and step-up requirement.
 
 **Public Interface.**
 - `pub fn load(cfg: &Config) -> Result<Manifest, PolicyError>` — load default + (if present and admin-signed) overlay; reject unsigned/invalid to the shipped default.
 - `pub fn resolve(&self, cap_id: &str) -> Option<ResolvedCapability>`
-- `pub fn authorise(&self, cap: &ResolvedCapability, verb: &str, raw_path: &str, session: &Session) -> Result<String, PolicyError>` — canonicalise path, check host/method/path, enforce budget; return the canonical path or a typed error.
+- `pub fn authorise(&self, cap: &ResolvedCapability, verb: &str, raw_path: &str, session: &Session) -> Result<String, PolicyError>` — **Rest only**: canonicalise path, check host/method/path, enforce budget; return the canonical path or a typed error.
+- `pub fn authorise_tool(&self, cap: &ResolvedCapability, tool: &str, session: &Session) -> Result<(), PolicyError>` — **Mcp only** (ADR-034): check `tool ∈ cap.tool_allow`, enforce budget and step-up; the `tools/list` the server advertises is never consulted.
 
 **Internal Logic.**
 1. Canonicalise `raw_path`: percent-decode once; reject residual `%`; resolve `.`/`..`; collapse `//`; residual `..` → `POLICY_PATH_REJECTED`.
@@ -122,6 +124,8 @@ Feature: AuditLogger
 3. No anchored regex in `cap.path_allow` matches → `POLICY_PATH_DENIED`.
 4. Budget: `session.calls_used + 1 > max_calls_*` → `RATE_LIMITED`.
 5. `cap.require_step_up` and the session's `id_token` `acr`/recency insufficient → `STEP_UP_REQUIRED` (carries the required `acr_values`/`max_age` for the C8 challenge). Manifest load fails closed if a capability requires step-up while no acceptable `acr` set is configured.
+6. **`authorise_tool` (Mcp, ADR-034).** `tool ∉ cap.tool_allow` → `MCP_TOOL_DENIED` (the advertised `tools/list` is never the authorisation surface); then apply the budget check (step 4) and the step-up check (step 5). No path canonicalisation or method check applies — an Mcp capability has no path or HTTP method.
+7. **Load-time kind validation (ADR-034).** Reject the manifest fail-closed (`CFG_INVALID` naming the capability) when a capability's fields contradict its `kind`: a Rest capability missing `host`/`pathAllow`/`methods` or carrying `serverUrl`/`toolAllow`; an Mcp capability missing `serverUrl`/`toolAllow` or carrying `host`/`pathAllow`/`methods`; or an Mcp `serverUrl` that is neither `https` nor a `http://127.0.0.1[:port]` loopback origin under the ADR-032 opt-in.
 
 **Error Table.**
 | Condition | Code | Status |
@@ -130,8 +134,10 @@ Feature: AuditLogger
 | traversal after canonicalisation | POLICY_PATH_REJECTED | 400 |
 | path not allowlisted | POLICY_PATH_DENIED | 403 |
 | method not allowed | POLICY_METHOD_DENIED | 403 |
+| MCP tool not in `toolAllow` (Mcp) | MCP_TOOL_DENIED | 403 |
 | budget exceeded | RATE_LIMITED | 429 |
 | step-up required | STEP_UP_REQUIRED | 401 |
+| kind/allowlist mismatch at load | CFG_INVALID | (startup fail-closed) |
 | unsigned/invalid override | (load) → falls back to default | n/a |
 
 **Gherkin.**
@@ -151,30 +157,45 @@ Feature: PolicyEngine
     Given an unsigned workspace pysandbox.policy.json override
     When load is called
     Then the override is rejected and only the shipped default is in force
+  Scenario: Happy path — allowed MCP tool authorised
+    Given an mcp capability whose toolAllow includes search_tickets
+    When authorise_tool(search_tickets) under budget
+    Then it returns Ok and no error
+  Scenario: Error — MCP tool not in the allowlist
+    Given an mcp capability whose toolAllow is [search_tickets]
+    When authorise_tool(delete_ticket) is called
+    Then it returns MCP_TOOL_DENIED (403) and the advertised tools/list is never consulted
+  Scenario: Error — kind/allowlist mismatch rejected at load
+    Given an mcp capability that also carries a host field
+    When load is called
+    Then the manifest is rejected fail-closed with CFG_INVALID naming the capability
 ```
-**Gaps.** None.
+**Gaps.** Server-mode write-gating of individual MCP tools (the `allowWrite` analogue for `tools/call`) is not specified in this increment — write sensitivity is gated only by `requireStepUpAuth` and per-argument constraints are deferred (ADR-034). Tracked alongside the deferred per-argument constraints.
 
 ---
 
 ### C5 ResponseSanitizer
 **File:** `src/sanitize.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.1
 
-**Purpose.** Reduce a raw downstream response to the typed `UntrustedResponse` envelope (ADR-017): strip headers to a safe allowlist, size-cap with a truncation flag, mark untrusted.
+**Purpose.** Reduce a raw downstream response to the typed `UntrustedResponse` envelope (REST), or an MCP `tools/call` result to the `UntrustedMcpResult` envelope (Mcp, ADR-034): strip headers to a safe allowlist, size-cap with a truncation flag, mark untrusted, and — for MCP — carry every content part without auto-dereferencing resource links (ADR-017).
 
 **Public Interface.**
 - `pub fn sanitize(&self, status: u16, raw: &[u8], headers: &HeaderMap, content_type: &str) -> UntrustedResponse`
+- `pub fn sanitize_mcp(&self, result: &McpToolResult) -> UntrustedMcpResult` — map an MCP `tools/call` result (`content[]` + optional `structuredContent` + `isError`) to the untrusted multi-part envelope.
 
 **Internal Logic.**
 1. Drop all response headers except `Content-Type`, `ETag`, `Retry-After`; never copy `Set-Cookie`/`Authorization`/`WWW-Authenticate`.
 2. Truncate body to `PYS_RESPONSE_MAX_BYTES`; set `truncated=true` if exceeded.
 3. Set `untrusted=true` always; record `unexpected_content_type_total` if not JSON/text.
 4. Return `UntrustedResponse`.
+5. **`sanitize_mcp` (ADR-034).** Map each `content[]` item to an `UntrustedPart`: `text`→`Text`, `image`/`audio`→`Image` (binary, size-capped), `resource_link`→`ResourceLink{ uri, mime_type }` (**uri only — the body is never fetched**), embedded `resource`→`EmbeddedResource{ uri, mime_type, body }` (inlined body size-capped); map `structuredContent` to a `Json` part. Enforce `PYS_RESPONSE_MAX_BYTES` per part and as an aggregate, setting `truncated=true` when exceeded and dropping overflow parts. Copy `isError` to `UntrustedMcpResult.is_error`. Set `untrusted=true` always. Return `UntrustedMcpResult`; never inline or follow a resource link.
 
 **Error Table.**
 | Condition | Effect |
 |---|---|
-| body exceeds cap | truncated, `truncated=true` (not an error) |
+| body / part exceeds cap | truncated, `truncated=true` (not an error) |
 | unexpected content-type | metric incremented; body returned as-is (not an error) |
+| MCP result has `isError=true` | mapped to `UntrustedMcpResult.is_error=true` (a tool-level signal, not a sanitiser error) |
 
 **Gherkin.**
 ```gherkin
@@ -191,6 +212,14 @@ Feature: ResponseSanitizer
     Given the response carries Set-Cookie
     When sanitize is called
     Then Set-Cookie is absent from the UntrustedResponse
+  Scenario: MCP — multi-part result mapped to untrusted parts
+    Given an MCP tools/call result with a text part and a structuredContent object
+    When sanitize_mcp is called
+    Then it returns untrusted=true with a Text part and a Json part
+  Scenario: MCP — resource link carried but not dereferenced
+    Given an MCP result containing a resource_link with a uri
+    When sanitize_mcp is called
+    Then the part is a ResourceLink carrying only the uri and no fetch is performed
 ```
 **Gaps.** None.
 
@@ -295,7 +324,7 @@ Feature: SessionManager
 1. Select the surface per `PYS_CONSENT_UI_MODE`: `browser` → the loopback sign-in flow (always used for OIDC `SignIn`); `dialog` → native dialog/tray; `auto` → browser for sign-in, dialog for consent.
 2. For `SignIn` (the concrete flow — ADR-029): do generic OIDC discovery at `<PYS_OIDC_ISSUER>/.well-known/openid-configuration`; generate a PKCE `code_verifier`/`code_challenge`, a CSPRNG `state`, and a `nonce`; bind a **transient `127.0.0.1:<ephemeral>` HTTP listener** as the `redirect_uri`; open the system browser to the `authorize` endpoint (`PYS_OIDC_CLIENT_ID` public client, `PYS_OIDC_SCOPES`, **plus a resource-audience request per entry in `what.audiences`** — ADR-033); on redirect verify `state`, close the single-use port, exchange the code (+ `code_verifier`) at the token endpoint, verify the `id_token` signature and `nonce`; **capture the `id_token` and `access_token` in the daemon only** (never returned to any client/guest); return `SignedIn(Principal)`.
    - **Resource-audience request (ADR-033).** For each audience `A` in `what.audiences`, add a Dex cross-client trusted-peer scope `audience:server:client_id:A` to the authorize request (the demo Dex mechanism; for a generic IdP the standards-track equivalent is the RFC 8707 `resource=A` parameter — OQ-G). The issued `access_token` then carries `aud` containing each `A`, so a pass-through resource server can validate it. When `what.audiences` is empty the request is unchanged from today.
-3. For `Consent`: show capability id, host, methods, provider, step-up flag (ADR-021); return `Allowed`/`Denied`.
+3. For `Consent`: show capability id, provider, step-up flag, and the kind-appropriate grant — **host + methods** for a Rest capability, or **server_url + the tool list** for an Mcp capability (ADR-021/ADR-034); return `Allowed`/`Denied`.
 4. For `StepUp`: drive the same loopback sign-in requesting the challenged `acr` **and the same `what.audiences`** (so the refreshed token stays audienced for the run's resources — ADR-033); return the fresh `id_token`/`access_token`.
 5. **Headless fallback:** if no browser/loopback (or `PYS_CONSENT_UI_MODE` selects none) and no elicitation/CLI renderer is available → `INTERACTION_UNAVAILABLE` (the Controller fails the call closed unless pre-consented/mock). Headless is a fallback posture, not the default. Remote/SSH topology (no local browser/loopback) is out of scope — device-code is the recorded future fallback (ADR-029).
 
@@ -428,27 +457,80 @@ Feature: DownstreamClient
 
 ---
 
-### C11 IdentityBroker
-**File:** `src/broker.rs` | **Dependencies:** Config, AuditLogger, PolicyEngine, ResponseSanitizer, OboClient, DownstreamClient, keychain · **derivedFromHld:** 0.4.1
+### C17 McpUpstreamClient
+**File:** `src/mcp_upstream.rs` | **Dependencies:** Config · **derivedFromHld:** ADR-034 · **(distinct from C16 — this is the outbound MCP *client*, C16 is the inbound MCP *server*)**
 
-**Purpose.** The single source of truth for credentials: hold tokens, maintain the capability table, route a `{capId, verb, path}` call to OBO (exchange) or direct provider, sanitise, and audit. Tokens never leave this module.
+**Purpose.** Issue an MCP JSON-RPC `tools/call` to one allowlisted downstream MCP server over **HTTP/SSE transport** with the broker-held credential applied; HTTPS-only (loopback `http` exception, ADR-032); no cross-origin redirect; size-capped read; return the raw MCP tool result for C5 to sanitise. The MCP analogue of C10 (REST). Never reached by the guest directly — only through the broker (C11). stdio transport is out of scope (ADR-034 / threat-model RR-10).
 
 **Public Interface.**
-- `pub fn mint_caps(&self, principal: &Principal, run_id: &str, client_label: &str, caps: &[ResolvedCapability]) -> Vec<CapabilityHandle>`
-- `pub async fn call(&self, cap_id: &[u8;16], verb: &str, path: &str, params: &Params, body: &[u8]) -> Result<UntrustedResponse, BrokerError>`
+- `pub async fn call_tool(&self, cap: &ResolvedCapability, tool: &str, arguments: &serde_json::Value, apply: impl Fn(&mut Request)) -> Result<McpToolResult, McpError>` — `McpToolResult` is the parsed-but-unsanitised tool result (`content[]` + optional `structuredContent` + `isError`) handed to C5.
 
 **Internal Logic.**
-1. `mint_caps`: generate a 128-bit `capId` per capability, valid ≤5 min, bound to the daemon instance; store `capId → ResolvedCapability + Principal + (run_id, client_label)` in the in-memory table. `run_id` is the server-minted run correlator and `client_label` the client-asserted label, bound here so each call's `AuditEntry` (step 4) is attributed to its run without per-run mutable broker state.
-2. `call`: look up `capId` (unknown/expired → `CAP_INVALID`); re-check host/path/method via PolicyEngine.
-3. Route by `cap.provider`: token-exchange → `OboClient.exchange` (surfaces step-up); direct → acquire the held token (OIDC session / keychain), apply via `DownstreamClient.do_call`.
-4. Sanitize the raw response (C5) → `UntrustedResponse`; write an `AuditEntry` (C3); return. Never serialise a token into the result.
+1. Resolve the origin from `cap.server_url`; choose the scheme: `https` by default; `http` **only** for a `127.0.0.1[:port]` loopback origin under `PYS_ALLOW_PLAINTEXT_LOOPBACK_EGRESS` (ADR-032); a remote `http` URL is never produced. The origin comes from policy, never caller input.
+2. Open or reuse a streamable-HTTP MCP session to the origin and perform the MCP `initialize` handshake (protocol version + client capabilities) once per session; `apply` attaches the broker-held credential to the HTTP transport; the redirect policy returns a 3xx as-is and never re-sends the credential across hosts (AS-17).
+3. Send JSON-RPC `tools/call { name: tool, arguments }`; read up to `PYS_RESPONSE_MAX_BYTES`+1; enforce the per-call timeout.
+4. Parse the JSON-RPC envelope: a JSON-RPC error, a malformed message, or a failed handshake → `MCP_PROTOCOL_ERROR`; a transport error/timeout → `MCP_UPSTREAM_UNAVAILABLE`/`MCP_UPSTREAM_TIMEOUT`. A successful result — **including one carrying `isError=true`** — is returned as `McpToolResult` (the tool-level `isError` is surfaced to the guest by C5, not treated as a transport failure).
 
 **Error Table.**
 | Condition | Code | Status |
 |---|---|---|
-| capId unknown/expired | CAP_INVALID | 403 |
+| per-call timeout | MCP_UPSTREAM_TIMEOUT | 504 |
+| connection/TLS/transport error | MCP_UPSTREAM_UNAVAILABLE | 502 |
+| malformed JSON-RPC / handshake or protocol failure | MCP_PROTOCOL_ERROR | 502 |
+
+**Gherkin.**
+```gherkin
+Feature: McpUpstreamClient
+  Scenario: Happy path — tools/call returns a result
+    Given an allowlisted https MCP server and an applied bearer
+    When call_tool(search_tickets, {...}) is invoked
+    Then it returns the McpToolResult for sanitisation
+  Scenario: Edge — cross-origin 3xx not followed
+    Given the MCP server responds 302 to another host
+    When call_tool is invoked
+    Then the 302 is returned as-is and the credential is not re-sent
+  Scenario: Edge — upstream tool error surfaced as a result
+    Given the tool returns a result with isError=true
+    When call_tool is invoked
+    Then it returns an McpToolResult with isError set, not a transport error
+  Scenario: Error — timeout
+    Given the server does not respond within the timeout
+    When call_tool is invoked
+    Then it returns MCP_UPSTREAM_TIMEOUT
+  Scenario: Security — a remote host is never downgraded to http
+    Given PYS_ALLOW_PLAINTEXT_LOOPBACK_EGRESS is true and the server origin is mcp.example.com
+    When call_tool is invoked
+    Then the request uses the https scheme
+```
+**Gaps.** None. *(Only streamable-HTTP/SSE transport is supported; stdio is excluded by design — ADR-034 / RR-10.)*
+
+---
+
+### C11 IdentityBroker
+**File:** `src/broker.rs` | **Dependencies:** Config, AuditLogger, PolicyEngine, ResponseSanitizer, OboClient, DownstreamClient, McpUpstreamClient, keychain · **derivedFromHld:** 0.4.1
+
+**Purpose.** The single source of truth for credentials: hold tokens, maintain the capability table, route a REST `{capId, verb, path}` call to OBO (exchange) or direct provider, or an MCP `{capId, tool, arguments}` call to the downstream MCP client (ADR-034), sanitise, and audit. Tokens never leave this module.
+
+**Public Interface.**
+- `pub fn mint_caps(&self, principal: &Principal, run_id: &str, client_label: &str, caps: &[ResolvedCapability]) -> Vec<CapabilityHandle>`
+- `pub async fn call(&self, cap_id: &[u8;16], verb: &str, path: &str, params: &Params, body: &[u8]) -> Result<UntrustedResponse, BrokerError>` — **Rest capabilities.**
+- `pub async fn call_tool(&self, cap_id: &[u8;16], tool: &str, arguments: &serde_json::Value) -> Result<UntrustedMcpResult, BrokerError>` — **Mcp capabilities** (ADR-034).
+
+**Internal Logic.**
+1. `mint_caps`: generate a 128-bit `capId` per capability, valid ≤5 min, bound to the daemon instance; store `capId → ResolvedCapability + Principal + (run_id, client_label)` in the in-memory table. `run_id` is the server-minted run correlator and `client_label` the client-asserted label, bound here so each call's `AuditEntry` (step 4) is attributed to its run without per-run mutable broker state.
+2. `call`: look up `capId` (unknown/expired → `CAP_INVALID`); reject if `cap.kind != Rest` → `CAP_INVALID`; re-check host/path/method via `PolicyEngine.authorise`.
+3. Route by `cap.provider`: token-exchange → `OboClient.exchange` (surfaces step-up); direct → acquire the held token (OIDC session / keychain), apply via `DownstreamClient.do_call`.
+4. Sanitize the raw response (C5) → `UntrustedResponse`; write an `AuditEntry` (C3); return. Never serialise a token into the result.
+5. **`call_tool` (Mcp, ADR-034).** Look up `capId` (unknown/expired → `CAP_INVALID`); reject if `cap.kind != Mcp` → `CAP_INVALID`; authorise via `PolicyEngine.authorise_tool` (`tool ∈ tool_allow`, budget, step-up); acquire the credential exactly as step 3 (exchange / passthrough / keychain — the same provider plugins); invoke `McpUpstreamClient.call_tool` (C17); sanitise the result via `ResponseSanitizer.sanitize_mcp` (C5) → `UntrustedMcpResult`; write an `AuditEntry` (C3 — `method="mcp.tools/call"`, `path=tool`, `host=server origin`); return. Never serialise a token into the result.
+
+**Error Table.**
+| Condition | Code | Status |
+|---|---|---|
+| capId unknown/expired, or kind mismatch for the entrypoint | CAP_INVALID | 403 |
+| MCP tool not in `toolAllow` | MCP_TOOL_DENIED | 403 |
 | step-up required (from OBO) | STEP_UP_REQUIRED | 401 |
 | exchange/downstream failure | EXCHANGE_FAILED / DOWNSTREAM_* | 502/504 |
+| MCP upstream failure | MCP_UPSTREAM_* / MCP_PROTOCOL_ERROR | 502/504 |
 | dependency unavailable | OBO_UNAVAILABLE / IDP_UNAVAILABLE | 503 |
 
 **Gherkin.**
@@ -466,6 +548,14 @@ Feature: IdentityBroker
     Given a capId past its 5-minute validity
     When call is invoked
     Then it returns CAP_INVALID and no outbound call is made
+  Scenario: Edge — MCP capability routed to the upstream client
+    Given a minted capId for an mcp capability and an allowed tool
+    When call_tool is invoked
+    Then authorise_tool passes, McpUpstreamClient is used, and an UntrustedMcpResult returns with no token
+  Scenario: Error — REST capId used on call_tool
+    Given a minted capId for a rest capability
+    When call_tool is invoked
+    Then it returns CAP_INVALID and no MCP call is made
 ```
 **Gaps.** None.
 
@@ -482,7 +572,7 @@ Feature: IdentityBroker
 **Internal Logic.**
 1. Verify the bundled WASM guest digest equals `PYS_GUEST_ARTIFACT_DIGEST`; mismatch → fail closed (`RUNTIME_ARTIFACT_MISMATCH`, ADR-018).
 2. Instantiate Wasmtime with the hardened config (ADR-019): a **deny-by-default WASI subset** — monotonic clock, randomness, and captured stdout/stderr (fd 1/2 → byte-capped buffers) only; **no filesystem (no preopens), no sockets, no environment, no args** — plus fuel, max memory, epoch deadline, transient-execution mitigations on, risky proposals off.
-3. Link exactly one **capability** host import — the broker call shim — that maps `{api_name → capId}` and forwards `{capId, verb, path}` to `IdentityBroker.call`, returning the `UntrustedResponse` to the guest. (The WASI subset above is host-provided plumbing, not a guest-grantable capability and not an egress path.)
+3. Link exactly one **capability** host import — the broker call shim — that maps `{api_name → capId}` and forwards a **tagged** broker request: `Rest{capId, verb, path, params?, body?}` → `IdentityBroker.call` (returns `UntrustedResponse`), or `McpTool{capId, tool, arguments}` → `IdentityBroker.call_tool` (returns `UntrustedMcpResult`) — ADR-034. The tag is carried *inside* the single import; this remains **one** capability host import, preserving the ADR-013/ADR-019 isolation invariant (no second egress path is linked). (The WASI subset above is host-provided plumbing, not a guest-grantable capability and not an egress path.)
 4. Inject `pysandbox_sdk`; run `code`; capture stdout/stderr from the WASI stdio sink (byte-capped); on fuel/epoch/memory limit → terminate with the matching limit error.
 
 **Error Table.**
@@ -506,6 +596,10 @@ Feature: SandboxRuntime
     Given a guest whose digest differs from PYS_GUEST_ARTIFACT_DIGEST
     When run is attempted
     Then instantiation fails closed with RUNTIME_ARTIFACT_MISMATCH
+  Scenario: Edge — guest calls an MCP tool via the same single host import
+    Given a verified guest and an mcp capability bundle
+    When run executes mcp.tickets.call_tool("search_tickets", {...})
+    Then the single broker shim forwards a McpTool-tagged request and an UntrustedMcpResult returns to the guest
 ```
 **Gaps.** None.
 
@@ -521,7 +615,7 @@ Feature: SandboxRuntime
 
 **Internal Logic.**
 1. Resolve each `requested_capability` via PolicyEngine; unknown → `CAP_UNKNOWN`.
-2. For each not-yet-consented capability in the session, raise `InteractionRequired::Consent` (C8); on decline → fail closed.
+2. For each not-yet-consented capability in the session, raise `InteractionRequired::Consent` (C8) populated for the capability's kind — host/methods for Rest, `server_url`/`tools` for Mcp (ADR-034); on decline → fail closed.
 3. If `dry_run`: return `DryRunResult{ planned_calls }` (static resolution only; no tokens, no egress).
 4. Collect the **distinct `audience` values** of the run's resolved capabilities (those that set one) into `audiences` (ADR-033). Ensure a valid `id_token`: raise `SignIn { issuer, audiences }` (C8) when none is held or it is expired, and raise `StepUp { acr_values, max_age_secs, audiences }` (C8) when a resolved capability sets `require_step_up` and the current `acr`/recency is insufficient; on a `STEP_UP_REQUIRED` returned from a call, drive step-up once and retry the call once (ADR-015/ADR-025). The held `access_token` is thereby audienced for each resource the run will call.
 5. Mint a server-side `run_id` (128-bit CSPRNG hex; never client-asserted) for audit correlation; `mint_caps` (C11) with `run_id` + the session's `client_label` → bundle; `SandboxRuntime.run` (C12); charge per-run budget (C7).
@@ -646,17 +740,18 @@ Feature: McpFrontDoor (mcp-stdio)
 **Purpose.** The only egress path for guest code, implemented over the single WASM host import the runtime links. Shape only (no other capability exists).
 
 **Public Interface (guest).**
-- `api.<provider>.get(path, *, params=None, headers=None)` / `.post(path, *, json=None, params=None, headers=None)` / `.patch(path, *, json=None)` / `.delete(path)` → an `UntrustedResponse`-shaped object `{ untrusted, status, content_type, body }`.
+- **REST capabilities:** `api.<provider>.get(path, *, params=None, headers=None)` / `.post(path, *, json=None, params=None, headers=None)` / `.patch(path, *, json=None)` / `.delete(path)` → an `UntrustedResponse`-shaped object `{ untrusted, status, content_type, body }`.
+- **MCP capabilities (ADR-034):** `mcp.<capability>.call_tool(name, arguments=None)` → an `UntrustedMcpResult`-shaped object `{ untrusted, is_error, parts }`, where each part is text / json / image / a resource link (uri only) / an embedded resource.
 
 **Internal Logic.**
-1. Providers populate from the capability bundle delivered via the host import (not a filesystem path).
-2. User `headers` are intersected with `{Accept, If-Match, Prefer}`; `Authorization` is dropped.
-3. Each call invokes the single host import with `{capId, verb, path, params?, body?}` and returns the typed untrusted envelope.
+1. Providers (REST) and capabilities (MCP) populate from the capability bundle delivered via the host import (not a filesystem path); a `kind=mcp` entry is addressed as `mcp.<capability>`, a `kind=rest` entry as `api.<provider>`.
+2. User `headers` are intersected with `{Accept, If-Match, Prefer}`; `Authorization` is dropped (REST). MCP `arguments` are passed through as a JSON value; no header surface is exposed for MCP.
+3. A REST call invokes the single host import with a `Rest`-tagged `{capId, verb, path, params?, body?}` and returns the typed untrusted envelope. An MCP call invokes the **same** single host import with a `McpTool`-tagged `{capId, tool, arguments}` and returns the typed untrusted multi-part envelope. The guest never auto-follows a returned resource link.
 
 **Error Table.**
 | Condition | Effect |
 |---|---|
-| capability not in bundle | raises `PermissionError` (no host import made) |
+| capability not in bundle (REST or MCP) | raises `PermissionError` (no host import made) |
 | broker returns error | raises a typed `SandboxError` carrying the code |
 
 **Gherkin.**
@@ -671,6 +766,13 @@ Feature: pysandbox_sdk
     Then the header is not forwarded
   Scenario: Error — ungranted provider
     When api.secret.get("/") is called and secret is not in the bundle
+    Then PermissionError is raised and no host import occurs
+  Scenario: MCP — call_tool returns the untrusted multi-part envelope
+    Given a bundle granting the mcp capability tickets
+    When mcp.tickets.call_tool("search_tickets", {"q": "open"}) is called
+    Then it returns an object with untrusted=true and a parts list
+  Scenario: MCP — ungranted mcp capability
+    When mcp.secret.call_tool("x") is called and secret is not in the bundle
     Then PermissionError is raised and no host import occurs
 ```
 **Gaps.** None.
