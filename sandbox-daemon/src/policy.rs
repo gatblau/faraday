@@ -144,7 +144,7 @@ impl PolicyEngine {
                             "mcp serverUrl must be https or a 127.0.0.1 loopback http origin",
                         ));
                     }
-                    // SPEC-GAP-1 (ADR-034): obo `exchange` is a server-side REST call and
+                    // SPEC-GAP-2 (ADR-034): obo `exchange` is a server-side REST call and
                     // cannot drive an MCP tools/call, so mcp + exchange is unsupported. A
                     // future obo MCP path would lift this; rejected fail-closed for now.
                     if matches!(c.auth_mode, AuthMode::Exchange) {
@@ -543,7 +543,7 @@ mod server_mode_tests {
 
     #[test]
     fn mcp_with_exchange_is_rejected() {
-        // SPEC-GAP-1: obo exchange cannot drive an MCP tools/call.
+        // SPEC-GAP-2 (ADR-034): obo exchange cannot drive an MCP tools/call.
         let j = r#"{"capabilities":{"m":{"kind":"mcp","authMode":"exchange","provider":"rfc8693","audience":"a://x","serverUrl":"https://m.example.com/mcp","toolAllow":["t"]}}}"#;
         assert_eq!(err_code(load(j)), "CFG_INVALID");
     }

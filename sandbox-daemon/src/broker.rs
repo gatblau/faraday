@@ -558,7 +558,7 @@ impl IdentityBroker {
             }
             // A public MCP server: no credential applied (ADR-037).
             AuthMode::Unauthenticated => mcp.call_tool(&cap, tool, arguments, |_req| {}).await,
-            // SPEC-GAP-1 (ADR-034): mcp + exchange is rejected at load (C4); defensive here.
+            // SPEC-GAP-2 (ADR-034): mcp + exchange is rejected at load (C4); defensive here.
             AuthMode::Exchange => return Err(BrokerError::CapInvalid),
         }
         .map_err(BrokerError::Mcp)?;
