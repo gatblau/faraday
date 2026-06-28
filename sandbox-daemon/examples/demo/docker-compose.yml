@@ -17,3 +17,13 @@ services:
     image: mccutchen/go-httpbin:v2.15.0
     ports:
       - "8080:8080"
+
+  # A downstream MCP server the sandbox calls through the broker (ADR-034). The reference
+  # "everything" server in streamable-HTTP mode exposes simple tools (echo, add, …) at
+  # http://127.0.0.1:3001/mcp — the `tools` capability in pysandbox.policy.json points here.
+  # Confirm the port/path on first run (the image's streamable-HTTP default is :3001/mcp).
+  mcp-everything:
+    image: mcp/everything
+    command: ["streamableHttp"]
+    ports:
+      - "3001:3001"

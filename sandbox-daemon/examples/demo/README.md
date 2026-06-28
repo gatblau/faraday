@@ -7,12 +7,14 @@ snippet then runs inside an isolated sandbox, fetches data from a stand-in web s
 returns it. Throughout, your login stays inside faraday — it is never passed to the snippet
 or to the agent.
 
-You run three things:
+You run these:
 
 - **faraday** — runs the snippet, makes the web calls on your behalf, and holds your login.
 - **Dex** — a stand-in for a company sign-in page, with one test account
   (`test@example.com` / `password`).
 - **A stand-in web service** — returns fixed data when asked for `/json`.
+- **A stand-in MCP server** — the reference "everything" server; exposes simple tools such
+  as `echo` and `add` that the snippet can call through faraday (the same broker door).
 
 The program is not code-signed yet, so macOS warns you the first time you run it. That is
 expected for local testing.
@@ -80,6 +82,7 @@ Docker runs both in the background.
 docker compose -f examples/demo/docker-compose.yml up -d
 # Sign-in page:   http://127.0.0.1:5556/dex   (log in with test@example.com / password)
 # Web service:    http://127.0.0.1:8080       (ask for /json to get sample data)
+# MCP server:     http://127.0.0.1:3001/mcp   (reference 'everything' server; tools: echo, add)
 ```
 
 ## Step 3 — Prepare two settings
@@ -137,12 +140,20 @@ custom-instructions). It tells the agent what the tool is and how to call an app
 You have a tool called `python_sandbox` that runs Python in a sandbox. To call an
 approved API, write Python using `api.<name>.get|post|patch|delete(path)` and list the
 capability names you use in `requestedCapabilities`. The call returns the response bytes;
-decode them with `.decode()`.
+decode them with `.decode()`. To call a tool on an approved MCP server, use
+`mcp.<name>.call_tool(tool, arguments)`; it returns a result whose `["parts"]` list carries
+the tool's output.
 
-For this demo, fetch the sample data:
+For this demo, fetch the sample data from the web service:
   tool:                  python_sandbox
   requestedCapabilities: ["dummy"]
   code:                  print(api.dummy.get('/json').decode())
+
+Or call a tool on the MCP server:
+  tool:                  python_sandbox
+  requestedCapabilities: ["tools"]
+  code:                  r = mcp.tools.call_tool("echo", {"message": "hi"})
+                         print(r["parts"][0]["text"])
 ```
 
 What happens:

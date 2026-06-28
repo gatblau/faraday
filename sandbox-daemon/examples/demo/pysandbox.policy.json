@@ -13,6 +13,12 @@
       "host": "catfact.ninja",
       "pathAllow": ["^/fact$"],
       "methods": ["GET"]
+    },
+    "tools": {
+      "kind": "mcp",
+      "authMode": "none",
+      "serverUrl": "http://127.0.0.1:3001/mcp",
+      "toolAllow": ["echo", "add"]
     }
   }
 }
