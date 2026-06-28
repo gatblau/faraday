@@ -1,4 +1,4 @@
 # Content digests of the bundled, integrity-verified artefacts (ADR-018).
 # Verified by SandboxRuntime::new before instantiation; fail-closed on mismatch.
 # format: <sha256>  <path>
-fd4e2842e7b17dc60e2fd0dfc12db4bcd6821b85a35f2909dd3883b1bcba88fb  guest/pysandbox-guest.wasm
+a503c943af18396850acd3c2e7af5e9ae695b047fe3b5ae502cf9f722023ea2c  guest/pysandbox-guest.wasm

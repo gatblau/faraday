@@ -92,8 +92,9 @@ impl BrokerError {
 }
 
 /// Object-safe broker-call seam consumed by the SandboxRuntime host shim (C12). The
-/// runtime forwards a guest call to `IdentityBroker.call` through this trait so the
-/// runtime can be tested against a stub; `IdentityBroker` is the production implementor.
+/// runtime forwards a guest call to `IdentityBroker.call` (REST) or `.call_tool` (MCP,
+/// ADR-034) through this trait so the runtime can be tested against a stub; `IdentityBroker`
+/// is the production implementor. The single tagged host import dispatches to one of these.
 pub trait BrokerCall: Send + Sync {
     fn call_boxed<'a>(
         &'a self,
@@ -103,6 +104,14 @@ pub trait BrokerCall: Send + Sync {
         params: &'a Params,
         body: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<UntrustedResponse, BrokerError>> + Send + 'a>>;
+
+    /// The MCP `tools/call` entry point (ADR-034). `arguments` is the JSON the guest passed.
+    fn call_tool_boxed<'a>(
+        &'a self,
+        cap_id: &'a [u8; 16],
+        tool: &'a str,
+        arguments: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = Result<UntrustedMcpResult, BrokerError>> + Send + 'a>>;
 }
 
 impl BrokerCall for IdentityBroker {
@@ -115,6 +124,15 @@ impl BrokerCall for IdentityBroker {
         body: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<UntrustedResponse, BrokerError>> + Send + 'a>> {
         Box::pin(self.call(cap_id, verb, path, params, body))
+    }
+
+    fn call_tool_boxed<'a>(
+        &'a self,
+        cap_id: &'a [u8; 16],
+        tool: &'a str,
+        arguments: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = Result<UntrustedMcpResult, BrokerError>> + Send + 'a>> {
+        Box::pin(self.call_tool(cap_id, tool, arguments))
     }
 }
 

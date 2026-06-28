@@ -4,8 +4,9 @@
 //!   - the agent Python `code` arrives on **stdin** (a host-controlled WASI pipe);
 //!   - `print(...)` output is captured by the host via **stdout/stderr** (WASI);
 //!   - the **only** egress is the single capability host import `env.broker_call`,
-//!     surfaced to Python as `pysandbox_sdk._call` and wrapped by the injected
-//!     `api.<name>.get/post/patch/delete(path)` SDK.
+//!     surfaced to Python as `pysandbox_sdk._call`/`_call_tool` and wrapped by the
+//!     injected `api.<name>.get/post/patch/delete(path)` and `mcp.<name>.call_tool(name,
+//!     arguments)` SDK (ADR-034). The import carries a leading tag (`0`=REST, `1`=MCP).
 //! No filesystem, sockets, env, or args are available (deny-by-default WASI subset).
 
 use rustpython_vm::scope::Scope;
@@ -15,15 +16,18 @@ use std::io::Read;
 // The single capability host import. Pointers are offsets into this guest's linear
 // memory (wasm pointers are `i32` offsets); the host reads the request strings and
 // writes the sanitised response body into `out`, returning its length (or `<0`).
+// The single capability host import carries a leading `kind` tag (ADR-034): `0` = REST
+// (`a`=verb, `b`=path), `1` = MCP tools/call (`a`=tool, `b`=arguments JSON).
 #[link(wasm_import_module = "env")]
 extern "C" {
     fn broker_call(
+        kind: i32,
         api_ptr: i32,
         api_len: i32,
-        verb_ptr: i32,
-        verb_len: i32,
-        path_ptr: i32,
-        path_len: i32,
+        a_ptr: i32,
+        a_len: i32,
+        b_ptr: i32,
+        b_len: i32,
         out_ptr: i32,
         out_cap: i32,
     ) -> i32;
@@ -31,16 +35,17 @@ extern "C" {
 
 const OUT_CAP: usize = 1 << 20; // 1 MiB response buffer
 
-fn broker_call_raw(api: &str, verb: &str, path: &str) -> Vec<u8> {
+fn broker_call_raw(kind: i32, api: &str, a: &str, b: &str) -> Vec<u8> {
     let mut out = vec![0u8; OUT_CAP];
     let n = unsafe {
         broker_call(
+            kind,
             api.as_ptr() as i32,
             api.len() as i32,
-            verb.as_ptr() as i32,
-            verb.len() as i32,
-            path.as_ptr() as i32,
-            path.len() as i32,
+            a.as_ptr() as i32,
+            a.len() as i32,
+            b.as_ptr() as i32,
+            b.len() as i32,
             out.as_mut_ptr() as i32,
             out.len() as i32,
         )
@@ -57,10 +62,23 @@ fn broker_call_raw(api: &str, verb: &str, path: &str) -> Vec<u8> {
 mod pysandbox_sdk {
     use rustpython_vm::{PyObjectRef, VirtualMachine};
 
-    /// `_call(api, verb, path) -> bytes` — forwards to the broker capability import.
+    /// `_call(api, verb, path) -> bytes` — forwards a REST call (tag `0`) to the broker.
     #[pyfunction]
     fn _call(api: String, verb: String, path: String, vm: &VirtualMachine) -> PyObjectRef {
-        let body = super::broker_call_raw(&api, &verb, &path);
+        let body = super::broker_call_raw(0, &api, &verb, &path);
+        vm.ctx.new_bytes(body).into()
+    }
+
+    /// `_call_tool(api, tool, arguments_json) -> bytes` — forwards an MCP tools/call (tag
+    /// `1`) to the broker (ADR-034); the bytes are the JSON `UntrustedMcpResult` envelope.
+    #[pyfunction]
+    fn _call_tool(
+        api: String,
+        tool: String,
+        arguments_json: String,
+        vm: &VirtualMachine,
+    ) -> PyObjectRef {
+        let body = super::broker_call_raw(1, &api, &tool, &arguments_json);
         vm.ctx.new_bytes(body).into()
     }
 }
@@ -84,6 +102,20 @@ class _Api:
     def __getattr__(self, name):
         return _Cap(name)
 api = _Api()
+import json as _json
+class _McpCap:
+    def __init__(self, name):
+        self._n = name
+    def call_tool(self, name, arguments=None):
+        args = _json.dumps(arguments if arguments is not None else {})
+        raw = _sdk._call_tool(self._n, name, args)
+        if not raw:
+            return None
+        return _json.loads(bytes(raw).decode("utf-8"))
+class _Mcp:
+    def __getattr__(self, name):
+        return _McpCap(name)
+mcp = _Mcp()
 "#;
 
 fn run_source(vm: &VirtualMachine, scope: Scope, src: &str, name: &str) -> PyResult<()> {

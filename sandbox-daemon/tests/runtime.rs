@@ -47,6 +47,34 @@ impl BrokerCall for StubBroker {
             })
         })
     }
+
+    fn call_tool_boxed<'a>(
+        &'a self,
+        _cap_id: &'a [u8; 16],
+        tool: &'a str,
+        arguments: &'a serde_json::Value,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<faradayd::types::UntrustedMcpResult, BrokerError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        // Echo the tool + arguments back as a text part so a guest round-trip is observable.
+        let tool = tool.to_string();
+        let args = arguments.to_string();
+        Box::pin(async move {
+            Ok(faradayd::types::UntrustedMcpResult {
+                untrusted: true,
+                is_error: false,
+                truncated: false,
+                parts: vec![faradayd::types::UntrustedPart::Text {
+                    content_type: "text/plain".into(),
+                    body: format!("{tool}:{args}").into_bytes(),
+                }],
+            })
+        })
+    }
 }
 
 /// A broker that always fails the call with a fixed error — exercises the shim's
@@ -63,6 +91,22 @@ impl BrokerCall for FailingBroker {
         _params: &'a faradayd::types::Params,
         _body: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<UntrustedResponse, BrokerError>> + Send + 'a>> {
+        let error = self.error.clone();
+        Box::pin(async move { Err(error) })
+    }
+
+    fn call_tool_boxed<'a>(
+        &'a self,
+        _cap_id: &'a [u8; 16],
+        _tool: &'a str,
+        _arguments: &'a serde_json::Value,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<faradayd::types::UntrustedMcpResult, BrokerError>>
+                + Send
+                + 'a,
+        >,
+    > {
         let error = self.error.clone();
         Box::pin(async move { Err(error) })
     }
@@ -110,6 +154,48 @@ async fn c12_real_python_broker_round_trip() {
     assert_eq!(r.api_calls[0].method, "GET");
     assert_eq!(r.api_calls[0].path, "/api/v2/tickets/42");
     assert_eq!(r.api_calls[0].status, Some(200));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c12_real_python_mcp_tool_round_trip() {
+    // ADR-034: the guest reaches an MCP tool through the same single host import (tag 1).
+    // The StubBroker echoes the tool + arguments as a text part; the SDK
+    // (`mcp.<cap>.call_tool`) parses the JSON envelope and the agent reads parts[0].text.
+    let broker = Arc::new(StubBroker {
+        body: Vec::new(),
+        status: 200,
+    });
+    let rt = runtime(broker);
+    let limits = Limits {
+        fuel: Some(u64::MAX),
+        epoch_deadline: Duration::from_secs(60),
+        ..Limits::default()
+    };
+    let code = r#"
+r = mcp.tickets.call_tool("search_tickets", {"q": "open"})
+print(r["untrusted"], r["parts"][0]["text"])
+"#;
+    let r = rt.run(code, &bundle(), &limits).await;
+
+    assert_eq!(
+        r.exit_code, 0,
+        "guest exited cleanly; stderr={:?}",
+        r.stderr
+    );
+    assert!(
+        r.stdout.contains("search_tickets"),
+        "the tool name round-tripped through the broker; stdout={:?}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("True"),
+        "the untrusted marker is present in the parsed envelope; stdout={:?}",
+        r.stdout
+    );
+    assert!(!r.stdout.contains("token"), "no token reaches the guest");
+    assert_eq!(r.api_calls.len(), 1, "one brokered MCP call");
+    assert_eq!(r.api_calls[0].method, "mcp.tools/call");
+    assert_eq!(r.api_calls[0].path, "search_tickets");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

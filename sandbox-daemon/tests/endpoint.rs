@@ -109,6 +109,28 @@ impl BrokerCall for StubBroker {
             })
         })
     }
+
+    fn call_tool_boxed<'a>(
+        &'a self,
+        _cap_id: &'a [u8; 16],
+        _tool: &'a str,
+        _arguments: &'a serde_json::Value,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<faradayd::types::UntrustedMcpResult, BrokerError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Ok(faradayd::types::UntrustedMcpResult {
+                untrusted: true,
+                is_error: false,
+                truncated: false,
+                parts: vec![],
+            })
+        })
+    }
 }
 
 struct StubSink;

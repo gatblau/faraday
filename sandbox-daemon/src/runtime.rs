@@ -10,7 +10,9 @@
 //! captured from **stdout/stderr**. The guest reaches the broker only via `broker_call`.
 
 use crate::broker::BrokerCall;
-use crate::types::{CallSummary, RunResult};
+use crate::types::{CallSummary, RunResult, UntrustedMcpResult, UntrustedPart};
+use base64::Engine as _;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -215,17 +217,21 @@ impl SandboxRuntime {
         }
     }
 
-    /// Link exactly one **capability** host import: `env.broker_call`. The shim reads
-    /// the `{api, verb, path}` strings from guest memory, maps `api → capId` via the
-    /// bundle, forwards to `IdentityBroker.call`, and writes the sanitised body back
-    /// into guest memory. A token is never written to guest memory.
+    /// Link exactly one **capability** host import: `env.broker_call`, carrying a **tagged**
+    /// request (ADR-034). `kind=0` is a REST call (`a`=verb, `b`=path) routed to
+    /// `IdentityBroker.call`; `kind=1` is an MCP `tools/call` (`a`=tool, `b`=arguments JSON)
+    /// routed to `IdentityBroker.call_tool`. The tag is carried inside the single import, so
+    /// this remains **one** capability host import (the ADR-013/019 isolation invariant). The
+    /// shim reads the strings from guest memory, maps `api → capId` via the bundle, forwards
+    /// to the broker, and writes the sanitised result back. A token is never written back.
     fn link_broker_shim(&self, linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         let broker = self.broker.clone();
         linker.func_wrap_async(
             "env",
             "broker_call",
             move |mut caller: Caller<'_, StoreData>,
-                  (api_ptr, api_len, verb_ptr, verb_len, path_ptr, path_len, out_ptr, out_cap): (
+                  (kind, api_ptr, api_len, a_ptr, a_len, b_ptr, b_len, out_ptr, out_cap): (
+                i32,
                 i32,
                 i32,
                 i32,
@@ -245,11 +251,12 @@ impl SandboxRuntime {
                         Some(s) => s,
                         None => return -1,
                     };
-                    let verb = match read_str(&mem, &caller, verb_ptr, verb_len) {
+                    // a = verb (rest) / tool (mcp); b = path (rest) / arguments JSON (mcp).
+                    let a = match read_str(&mem, &caller, a_ptr, a_len) {
                         Some(s) => s,
                         None => return -1,
                     };
-                    let path = match read_str(&mem, &caller, path_ptr, path_len) {
+                    let b = match read_str(&mem, &caller, b_ptr, b_len) {
                         Some(s) => s,
                         None => return -1,
                     };
@@ -258,51 +265,144 @@ impl SandboxRuntime {
                         None => return -1, // unknown api name → guest-visible error
                     };
 
-                    let no_params = Vec::new();
-                    let outcome = broker
-                        .call_boxed(&cap_id, &verb, &path, &no_params, &[])
-                        .await;
-                    match outcome {
-                        Ok(resp) => {
-                            let n = resp.body.len().min(out_cap.max(0) as usize);
-                            if mem
-                                .write(&mut caller, out_ptr as usize, &resp.body[..n])
-                                .is_err()
-                            {
-                                return -1;
+                    match kind {
+                        // REST call (C10/C11).
+                        0 => {
+                            let no_params = Vec::new();
+                            match broker.call_boxed(&cap_id, &a, &b, &no_params, &[]).await {
+                                Ok(resp) => {
+                                    let n = resp.body.len().min(out_cap.max(0) as usize);
+                                    if mem
+                                        .write(&mut caller, out_ptr as usize, &resp.body[..n])
+                                        .is_err()
+                                    {
+                                        return -1;
+                                    }
+                                    caller.data_mut().calls.push(CallSummary {
+                                        provider: String::new(),
+                                        host: String::new(),
+                                        path: b,
+                                        method: a,
+                                        status: Some(resp.status),
+                                    });
+                                    n as i32
+                                }
+                                Err(e) => {
+                                    let diag = format!("broker_call {a} {b}: {}\n", e.code());
+                                    let data = caller.data_mut();
+                                    data.host_stderr.push_str(&diag);
+                                    data.calls.push(CallSummary {
+                                        provider: String::new(),
+                                        host: String::new(),
+                                        path: b,
+                                        method: a,
+                                        status: None,
+                                    });
+                                    -1
+                                }
                             }
-                            caller.data_mut().calls.push(CallSummary {
-                                provider: String::new(),
-                                host: String::new(),
-                                path,
-                                method: verb,
-                                status: Some(resp.status),
-                            });
-                            n as i32
                         }
-                        Err(e) => {
-                            // Surface the broker-error code on stderr so a failed call
-                            // is observable, instead of decoding to empty bytes. The
-                            // code is a stable registry string (broker.rs) — never a
-                            // token or response body.
-                            let diag = format!("broker_call {verb} {path}: {}\n", e.code());
-                            let data = caller.data_mut();
-                            data.host_stderr.push_str(&diag);
-                            data.calls.push(CallSummary {
-                                provider: String::new(),
-                                host: String::new(),
-                                path,
-                                method: verb,
-                                status: None,
-                            });
-                            -1
+                        // MCP tools/call (C17/C11, ADR-034).
+                        1 => {
+                            let arguments: Value = if b.trim().is_empty() {
+                                json!({})
+                            } else {
+                                match serde_json::from_str(&b) {
+                                    Ok(v) => v,
+                                    Err(_) => return -1, // malformed guest arguments
+                                }
+                            };
+                            match broker.call_tool_boxed(&cap_id, &a, &arguments).await {
+                                Ok(result) => {
+                                    let body = mcp_result_to_json(&result);
+                                    let n = body.len().min(out_cap.max(0) as usize);
+                                    if mem
+                                        .write(&mut caller, out_ptr as usize, &body[..n])
+                                        .is_err()
+                                    {
+                                        return -1;
+                                    }
+                                    caller.data_mut().calls.push(CallSummary {
+                                        provider: String::new(),
+                                        host: String::new(),
+                                        path: a,
+                                        method: "mcp.tools/call".to_string(),
+                                        status: Some(200),
+                                    });
+                                    n as i32
+                                }
+                                Err(e) => {
+                                    let diag = format!("broker_call mcp {a}: {}\n", e.code());
+                                    let data = caller.data_mut();
+                                    data.host_stderr.push_str(&diag);
+                                    data.calls.push(CallSummary {
+                                        provider: String::new(),
+                                        host: String::new(),
+                                        path: a,
+                                        method: "mcp.tools/call".to_string(),
+                                        status: None,
+                                    });
+                                    -1
+                                }
+                            }
                         }
+                        _ => -1, // unknown tag
                     }
                 })
             },
         )?;
         Ok(())
     }
+}
+
+/// Serialise an `UntrustedMcpResult` to the JSON the guest SDK parses (ADR-034). Binary
+/// parts (image / embedded resource) are base64-encoded under `data_b64`; a text part's
+/// body is decoded lossily; a `structuredContent` part is embedded as JSON; a resource
+/// link carries a uri only. The `untrusted` marker is always present.
+fn mcp_result_to_json(r: &UntrustedMcpResult) -> Vec<u8> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let parts: Vec<Value> = r
+        .parts
+        .iter()
+        .map(|p| match p {
+            UntrustedPart::Text { content_type, body } => json!({
+                "type": "text",
+                "content_type": content_type,
+                "text": String::from_utf8_lossy(body),
+            }),
+            UntrustedPart::Json { body } => json!({
+                "type": "json",
+                "json": serde_json::from_slice::<Value>(body).unwrap_or(Value::Null),
+            }),
+            UntrustedPart::Image { mime_type, body } => json!({
+                "type": "image",
+                "mime_type": mime_type,
+                "data_b64": b64.encode(body),
+            }),
+            UntrustedPart::ResourceLink { uri, mime_type } => json!({
+                "type": "resource_link",
+                "uri": uri,
+                "mime_type": mime_type,
+            }),
+            UntrustedPart::EmbeddedResource {
+                uri,
+                mime_type,
+                body,
+            } => json!({
+                "type": "embedded_resource",
+                "uri": uri,
+                "mime_type": mime_type,
+                "data_b64": b64.encode(body),
+            }),
+        })
+        .collect();
+    let v = json!({
+        "untrusted": r.untrusted,
+        "is_error": r.is_error,
+        "truncated": r.truncated,
+        "parts": parts,
+    });
+    serde_json::to_vec(&v).unwrap_or_default()
 }
 
 fn fail(code: i32, stderr: String) -> RunResult {
@@ -353,4 +453,44 @@ fn sha256_hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_result_json_shape() {
+        let result = UntrustedMcpResult {
+            untrusted: true,
+            is_error: false,
+            truncated: true,
+            parts: vec![
+                UntrustedPart::Text {
+                    content_type: "text/plain".into(),
+                    body: b"hello".to_vec(),
+                },
+                UntrustedPart::ResourceLink {
+                    uri: "file:///x".into(),
+                    mime_type: None,
+                },
+                UntrustedPart::Image {
+                    mime_type: "image/png".into(),
+                    body: b"hi".to_vec(),
+                },
+            ],
+        };
+        let v: Value = serde_json::from_slice(&mcp_result_to_json(&result)).unwrap();
+        assert_eq!(v["untrusted"], json!(true));
+        assert_eq!(v["is_error"], json!(false));
+        assert_eq!(v["truncated"], json!(true));
+        let parts = v["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], json!("text"));
+        assert_eq!(parts[0]["text"], json!("hello"));
+        assert_eq!(parts[1]["type"], json!("resource_link"));
+        assert_eq!(parts[1]["uri"], json!("file:///x"));
+        // "hi" base64-encoded is "aGk=" — the link before it is never given a body.
+        assert_eq!(parts[2]["type"], json!("image"));
+        assert_eq!(parts[2]["data_b64"], json!("aGk="));
+    }
 }
