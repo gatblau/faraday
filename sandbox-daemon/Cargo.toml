@@ -28,6 +28,10 @@ path = "src/main.rs"
 [features]
 # Gates the integration tests (real interfaces; brought up per the plan).
 integration = []
+# Gates the opt-in real-OS-keychain smoke test (ADR-040 FU-001). Needs a keychain backend
+# on the host (macOS/Windows native; Linux needs gnome-keyring + dbus). Off by default and
+# off in the `integration` job; enabled by a per-OS run/job.
+real-keyring = []
 
 [dependencies]
 # The local control-plane IPC seam: platform transport + peer principal + framed protocol
