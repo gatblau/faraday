@@ -52,6 +52,29 @@ impl ApiKeyStore for HashMap<String, String> {
     }
 }
 
+/// Resolve each `api_key` capability's `secretRef` once at startup (ADR-036), trimming a
+/// single trailing newline, into the frozen `secretRef → key` map the `ApiKeyStore` holds.
+/// Fails closed on an unreadable reference. Backend-agnostic — the `SecretResolver` may be
+/// file- or keychain-backed (ADR-040).
+pub fn freeze_api_keys(
+    secret_refs: Vec<String>,
+    resolver: &dyn crate::config::SecretResolver,
+) -> Result<HashMap<String, String>, crate::config::ConfigError> {
+    let mut map = HashMap::new();
+    for secret_ref in secret_refs {
+        let bytes = resolver.resolve(&secret_ref)?;
+        let mut key = String::from_utf8_lossy(&bytes).into_owned();
+        if key.ends_with('\n') {
+            key.pop();
+            if key.ends_with('\r') {
+                key.pop();
+            }
+        }
+        map.insert(secret_ref, key);
+    }
+    Ok(map)
+}
+
 /// Typed broker failure (Phase-4 XC2 registry codes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrokerError {

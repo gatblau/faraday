@@ -10,12 +10,14 @@ pub mod broker; // C11
 pub mod clientauth; // C6
 pub mod config; // C1
 pub mod controller; // C13
+pub mod credential; // C18 `faradayd credential` enrolment CLI (ADR-040)
 pub mod downstream; // C10
 pub mod endpoint; // C14
 pub mod errors; // C2
 pub mod health; // C15
 pub mod install; // ADR-031 installer helpers (MCP-config merge)
 pub mod interaction; // C8
+pub mod keychain; // ADR-040 OS-keychain secret seam (C1 KeychainSecretResolver, C18 CLI)
 pub mod log; // XC3 structured logging + redaction
 pub mod mcp; // C16 MCP front door (`mcp-stdio` sub-mode)
 pub mod mcp_upstream; // C17 outbound MCP client (ADR-034)

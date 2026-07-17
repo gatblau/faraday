@@ -51,6 +51,11 @@ getrandom = "0.2"
 # single host import). async_support is used so the broker call shim can be async.
 wasmtime = "45.0.1"
 wasmtime-wasi = "45"
+# ADR-040: OS secure store for keychain-backed api_key secrets (C1 KeychainSecretResolver,
+# C18 credential CLI). Native backends per platform; no non-file resolver was shipped before.
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+# ADR-040 C18: no-echo TTY read for `faradayd credential set` (the token is never an argv value).
+rpassword = "7"
 
 [dev-dependencies]
 # `process` (dev-only) lets the mcp integration test spawn the real `mcp-stdio` sub-mode

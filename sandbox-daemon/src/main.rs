@@ -11,13 +11,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use faradayd::audit::{AuditLogger, AuditSink};
-use faradayd::broker::{ApiKeyStore, BrokerCall, CredentialSource, IdentityBroker};
-use faradayd::config::{Config, FileSecretResolver, SecretResolver};
+use faradayd::broker::{
+    freeze_api_keys, ApiKeyStore, BrokerCall, CredentialSource, IdentityBroker,
+};
+use faradayd::config::Config;
 use faradayd::controller::{CapabilityMinter, IdTokenSink, Interactor, SandboxController};
+use faradayd::credential::{parse_cmd, run_credential, CredentialError};
 use faradayd::downstream::{DownstreamClient, DEFAULT_CALL_TIMEOUT};
 use faradayd::endpoint::Daemon;
 use faradayd::health::HealthCheck;
 use faradayd::interaction::{ConsentSummary, ConsentUI, InteractionSurface};
+use faradayd::keychain::{build_resolver, resolver_kind, KeyringStore};
 use faradayd::mcp_upstream::McpUpstreamClient;
 use faradayd::obo::OboClient;
 use faradayd::policy::PolicyEngine;
@@ -221,6 +225,74 @@ fn run_install_mcp_config() -> i32 {
     }
 }
 
+/// Implements `faradayd credential set|rm|list <secretRef>` (ADR-040 C18): enrol, remove, or
+/// list api_key secrets in the OS keychain. The token is read no-echo from stdin (or piped
+/// bytes for automation), never taken as a command-line argument. Validates the `secretRef`
+/// against the admin-signed manifest before writing.
+fn run_credential_cli() -> i32 {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let service = std::env::var("PYS_KEYCHAIN_SERVICE").unwrap_or_else(|_| "faradayd".to_string());
+
+    let policy_path = match std::env::var("PYS_POLICY_PATH") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("CRED_USAGE: PYS_POLICY_PATH is not set");
+            return 2;
+        }
+    };
+    let policy_json = match std::fs::read_to_string(&policy_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("CRED_USAGE: cannot read policy at {policy_path}: {e}");
+            return 2;
+        }
+    };
+    let policy = match PolicyEngine::load(&policy_json, None, &|_, _| false) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("CRED_USAGE: policy load error: {}", e.code);
+            return 2;
+        }
+    };
+
+    let cmd = match parse_cmd(&args, read_token) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    match run_credential(cmd, &service, &policy, &KeyringStore) {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+/// Read the api_key token: no-echo from the terminal when stdin is a TTY (prompt to stderr),
+/// otherwise the piped stdin bytes. The value is never echoed to stdout and never logged.
+fn read_token() -> Result<Vec<u8>, CredentialError> {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        rpassword::prompt_password("token: ")
+            .map(String::into_bytes)
+            .map_err(|_| CredentialError::input("could not read token from terminal"))
+    } else {
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .map(|_| buf)
+            .map_err(|_| CredentialError::input("could not read token from stdin"))
+    }
+}
+
 fn die(context: &str, e: impl std::fmt::Debug) -> ! {
     eprintln!("{context}: {e:?}");
     std::process::exit(1);
@@ -242,9 +314,20 @@ async fn main() {
     if std::env::args().nth(1).as_deref() == Some("install-mcp-config") {
         std::process::exit(run_install_mcp_config());
     }
+    // `faradayd credential set|rm|list <secretRef>` — enrol/remove/list api_key keychain
+    // secrets (ADR-040 C18). The token is read no-echo from stdin, never from argv.
+    if std::env::args().nth(1).as_deref() == Some("credential") {
+        std::process::exit(run_credential_cli());
+    }
 
-    let resolver = FileSecretResolver;
-    let config = match Config::load(&|k| std::env::var(k).ok(), &resolver) {
+    // ADR-040: select the secret backend once at startup — file (default) or OS keychain —
+    // and use it for both `*_REF` config secrets and the api_key freeze below. Unknown
+    // selector fails closed (CFG_INVALID).
+    let resolver = match resolver_kind(&|k| std::env::var(k).ok()) {
+        Ok(kind) => build_resolver(kind),
+        Err(e) => die("config error", e),
+    };
+    let config = match Config::load(&|k| std::env::var(k).ok(), resolver.as_ref()) {
         Ok(c) => c,
         Err(e) => die("config error", e),
     };
@@ -285,25 +368,13 @@ async fn main() {
         id_token: Mutex::new(None),
         access_token: Mutex::new(None),
     });
-    // ADR-036 / AS-6: resolve each api_key capability's key once at startup, file-backed
-    // via the SecretResolver, trimming a single trailing newline; fail closed on an
-    // unreadable reference. Frozen into the ApiKeyStore the broker holds.
-    let mut api_key_map: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for secret_ref in policy.api_key_secret_refs() {
-        let bytes = match resolver.resolve(&secret_ref) {
-            Ok(b) => b,
-            Err(e) => die("api key resolve error", e),
-        };
-        let mut key = String::from_utf8_lossy(&bytes).into_owned();
-        if key.ends_with('\n') {
-            key.pop();
-            if key.ends_with('\r') {
-                key.pop();
-            }
-        }
-        api_key_map.insert(secret_ref, key);
-    }
+    // ADR-036 / AS-6 (+ ADR-040): resolve each api_key capability's key once at startup via
+    // the selected SecretResolver (file or keychain), trimming a single trailing newline;
+    // fail closed on an unreadable reference. Frozen into the ApiKeyStore the broker holds.
+    let api_key_map = match freeze_api_keys(policy.api_key_secret_refs(), resolver.as_ref()) {
+        Ok(m) => m,
+        Err(e) => die("api key resolve error", e),
+    };
     let api_keys: Arc<dyn ApiKeyStore> = Arc::new(api_key_map);
 
     // C17 outbound MCP client (ADR-034): HTTPS-only with the ADR-032 loopback exception,
