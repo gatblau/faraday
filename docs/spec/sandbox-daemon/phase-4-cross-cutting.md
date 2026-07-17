@@ -38,7 +38,7 @@ Feature: Client authentication
 ---
 
 ### XC2 — Error Handling & Code Registry (`WireError`, C2)
-**File:** `src/errors.rs` | **derivedFromHld:** 0.4.1
+**File:** `src/errors.rs` | **derivedFromHld:** 0.4.2
 
 **Purpose.** One `WireError { error, code }` envelope and a canonical code→status registry; a panic-recovery boundary so every component emits identical, leak-free errors (no internal state, no token, no stack trace on the wire).
 
@@ -91,7 +91,7 @@ Feature: WireError
 ---
 
 ### XC7 — Health Checks (HealthCheck, C15)
-**File:** `src/health.rs` | **derivedFromHld:** 0.4.1
+**File:** `src/health.rs` | **derivedFromHld:** 0.4.2
 
 **Purpose.** Local-only liveness/readiness for the per-user service (ADR-023); consumed by the OS service manager. Not network-exposed.
 

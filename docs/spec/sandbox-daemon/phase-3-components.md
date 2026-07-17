@@ -25,20 +25,22 @@ All components are Rust modules in one binary (HLD ADR-026). Each carries Public
 ---
 
 ### C1 Config
-**File:** `src/config.rs` | **Phase:** 3 | **Dependencies:** none · **derivedFromHld:** 0.4.1
+**File:** `src/config.rs` | **Phase:** 3 | **Dependencies:** none · **derivedFromHld:** 0.4.2
 
 **Purpose.** Load, validate, and expose all runtime configuration (Phase 2D `PYS_*`) once at startup, failing closed on any missing/invalid value or unverifiable secret reference.
 
 **Public Interface.**
 - `pub fn load(env: &dyn Env, resolver: &dyn SecretResolver) -> Result<Config, ConfigError>` — parse, resolve `*_REF` secrets, validate; return an immutable `Config` or the first invalid field.
 - `pub trait SecretResolver { fn resolve(&self, reference: &str) -> Result<Vec<u8>, ConfigError>; }` — the secret-resolution SPI. Resolves both `PYS_*_REF` config secrets and each `api_key` capability's `secretRef` (ADR-036).
-- `pub struct FileSecretResolver` (impl `SecretResolver`) — the default resolver: treats the reference as a file path and reads its bytes (`CFG_SECRET_UNRESOLVED` on failure), matching the repo `*_REF` → file convention. **Keychain / workload-identity resolvers are a later phase** (the trait is the extension point; no non-file resolver is implemented yet).
+- `pub struct FileSecretResolver` (impl `SecretResolver`) — the default resolver: treats the reference as a file path and reads its bytes (`CFG_SECRET_UNRESOLVED` on failure), matching the repo `*_REF` → file convention.
+- `pub struct KeychainSecretResolver` (impl `SecretResolver`) — **[Not implemented] (ADR-040 — no code yet).** Resolves a reference from the **OS secure store** (macOS Keychain, Windows Credential Manager, Linux Secret Service) via the OS-keychain crate, looking up the entry `(service = PYS_KEYCHAIN_SERVICE, account = reference)`; `CFG_SECRET_UNRESOLVED` if the entry is absent. The active resolver is selected once at startup by `PYS_SECRET_RESOLVER` (`file` default | `keychain`) and injected into `load` and the C11 `ApiKeyStore` freeze, so an `api_key` capability's `secretRef` resolves from the chosen backend uniformly — the auth mode, `secretRef`, and `keyPlacement` (ADR-036) are unchanged, only the key's origin differs.
 
 **Internal Logic.**
 1. Read every Phase-2D variable; apply defaults where unset.
 2. Resolve each `*_REF` via `resolver`; on error → `CFG_SECRET_UNRESOLVED`.
 3. Validate: `PYS_OIDC_ISSUER` is an `https` URL (loopback `http://127.0.0.1`/`http://localhost` permitted — ADR-029); `PYS_RESPONSE_MAX_BYTES` ≤ 1 MiB; budgets ≥ 1; `PYS_GUEST_ARTIFACT_DIGEST` non-empty; `PYS_ALLOW_PLAINTEXT_LOOPBACK_EGRESS` is a bool (default `false`) — when `true`, C10 may use `http` for a `127.0.0.1` provider host only (ADR-032); if any capability uses a token-exchange provider then `PYS_OBO_ENDPOINT` is set; in real-credential mode `PYS_OTLP_ENDPOINT` is set (else degrade to mock per ADR-016). On failure → `CFG_INVALID` naming the field.
 4. Return an immutable `Config`; log resolved non-secret fields at `info`; never log secret values.
+5. **Resolver selection (ADR-040, [Not implemented]).** `PYS_SECRET_RESOLVER` (`file` default | `keychain`) selects the `SecretResolver` implementation constructed at startup and injected here and into the C11 `ApiKeyStore` freeze. `secretRef` is interpreted by the active resolver — a file path for `FileSecretResolver`, a keychain account under `PYS_KEYCHAIN_SERVICE` for `KeychainSecretResolver`. An unknown `PYS_SECRET_RESOLVER` value fails closed (`CFG_INVALID`).
 
 **Error Table.**
 | Condition | Code | Effect |
@@ -68,7 +70,7 @@ Feature: Config
 ---
 
 ### C3 AuditLogger
-**File:** `src/audit.rs` | **Dependencies:** Config, OTel SDK · **derivedFromHld:** 0.4.1
+**File:** `src/audit.rs` | **Dependencies:** Config, OTel SDK · **derivedFromHld:** 0.4.2
 
 **Purpose.** Emit one append-only `AuditEntry` per outbound call — sizes + keyed-HMAC user id only, never tokens/bodies — and export via OTLP; mandatory in real-credential mode (ADR-016).
 
@@ -109,7 +111,7 @@ Feature: AuditLogger
 ---
 
 ### C4 PolicyEngine
-**File:** `src/policy.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.1
+**File:** `src/policy.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.2
 
 **Purpose.** Load the capability manifest fail-closed (admin-signed overrides only, ADR-021), resolve a `capabilityId` to a `ResolvedCapability`, and authorise a call: for a Rest capability, canonical-path/method/host allowlist; for an Mcp capability (ADR-034), the `toolAllow` tool-name allowlist; both plus per-run/session budget and step-up requirement. Load also validates each capability's `authMode` (ADR-036/037) — the `secretRef`/`keyPlacement` coherence for `api_key` and the step-up-inapplicability for `api_key`/`none` — and the write gate (ADR-039).
 
@@ -190,7 +192,7 @@ Feature: PolicyEngine
 ---
 
 ### C5 ResponseSanitizer
-**File:** `src/sanitize.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.1
+**File:** `src/sanitize.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.2
 
 **Purpose.** Reduce a raw downstream response to the typed `UntrustedResponse` envelope (REST), or an MCP `tools/call` result to the `UntrustedMcpResult` envelope (Mcp, ADR-034): strip headers to a safe allowlist, size-cap with a truncation flag, mark untrusted, and — for MCP — carry every content part without auto-dereferencing resource links (ADR-017).
 
@@ -241,7 +243,7 @@ Feature: ResponseSanitizer
 ---
 
 ### C6 ClientAuth
-**File:** `src/clientauth.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.1 · **(security-critical — ADR-024)**
+**File:** `src/clientauth.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.2 · **(security-critical — ADR-024)**
 
 **Purpose.** Authenticate a connecting client: the peer principal equals the daemon's, the per-launch connection token matches, and (optionally) a new client identity passes first-connect consent. The connection token is minted by the transport seam (`faradayd-ipc::mint_token`, a `getrandom` CSPRNG) and written `0600` by the control endpoint at startup; C6 no longer mints it.
 
@@ -287,7 +289,7 @@ Feature: ClientAuth
 ---
 
 ### C7 SessionManager
-**File:** `src/session.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.1
+**File:** `src/session.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.2
 
 **Purpose.** Hold per-`(client, workspace)` sessions in memory: consent cache and per-session call budget.
 
@@ -328,7 +330,7 @@ Feature: SessionManager
 ---
 
 ### C8 ConsentUI
-**File:** `src/interaction.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.1
+**File:** `src/interaction.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.2
 
 **Purpose.** Render `InteractionRequired` (sign-in/consent/step-up, ADR-025) on a daemon-owned surface; return the result to the Controller. Never trusts a client-asserted result.
 
@@ -380,7 +382,7 @@ Feature: ConsentUI
 ---
 
 ### C9 OboClient
-**File:** `src/obo.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.1
+**File:** `src/obo.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.2
 
 **Purpose.** Call the backend `obo-broker` `POST /v1/exchange` for token-exchange providers; surface the RFC 9470 step-up challenge.
 
@@ -421,7 +423,7 @@ Feature: OboClient
 ---
 
 ### C10 DownstreamClient
-**File:** `src/downstream.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.1
+**File:** `src/downstream.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.2
 
 **Purpose.** Issue the direct-provider HTTPS call (e.g. `github`) with the broker-held credential applied; no cross-origin redirect; size-capped read. Egress is HTTPS-only, with one bounded exception: plaintext to a **loopback** provider when explicitly enabled for the dev-machine topology (ADR-032).
 
@@ -522,7 +524,7 @@ Feature: McpUpstreamClient
 ---
 
 ### C11 IdentityBroker
-**File:** `src/broker.rs` | **Dependencies:** Config, AuditLogger, PolicyEngine, ResponseSanitizer, OboClient, DownstreamClient, McpUpstreamClient, CredentialSource, ApiKeyStore · **derivedFromHld:** 0.4.1
+**File:** `src/broker.rs` | **Dependencies:** Config, AuditLogger, PolicyEngine, ResponseSanitizer, OboClient, DownstreamClient, McpUpstreamClient, CredentialSource, ApiKeyStore · **derivedFromHld:** 0.4.2
 
 **Purpose.** The single source of truth for credentials: hold tokens, maintain the capability table, route a REST `{capId, verb, path}` call by its `authMode` (ADR-036/037) — `exchange` (OBO), `passthrough`, `api_key`, or `none` — or an MCP `{capId, tool, arguments}` call to the downstream MCP client (ADR-034), sanitise, and audit. Tokens and static keys never leave this module. Two credential sources are injected: `CredentialSource` (the user's held `id_token`/`access_token`) and `ApiKeyStore` (the startup-frozen per-capability `api_key` keys, resolved once via the C1 `SecretResolver`).
 
@@ -582,7 +584,7 @@ Feature: IdentityBroker
 ---
 
 ### C12 SandboxRuntime
-**File:** `src/runtime.rs` | **Dependencies:** Config, IdentityBroker · **derivedFromHld:** 0.4.1 · **(security-critical — ADR-013/019)**
+**File:** `src/runtime.rs` | **Dependencies:** Config, IdentityBroker · **derivedFromHld:** 0.4.2 · **(security-critical — ADR-013/019)**
 
 **Purpose.** Run agent Python as RustPython-on-Wasmtime with no ambient authority and exactly one *capability* host import (the broker call shim), plus a hardened deny-by-default WASI subset (clock/random/captured-stdio only); enforce resource limits; verify the guest artefact digest before instantiation.
 
@@ -626,7 +628,7 @@ Feature: SandboxRuntime
 ---
 
 ### C13 SandboxController
-**File:** `src/controller.rs` | **Dependencies:** IdentityBroker, SandboxRuntime, PolicyEngine, ConsentUI, SessionManager, AuditLogger · **derivedFromHld:** 0.4.1
+**File:** `src/controller.rs` | **Dependencies:** IdentityBroker, SandboxRuntime, PolicyEngine, ConsentUI, SessionManager, AuditLogger · **derivedFromHld:** 0.4.2
 
 **Purpose.** Orchestrate one `run`: resolve + consent capabilities, mint the bundle, launch the runtime, route `interaction_required`, redact output, and return — never returning a token.
 
@@ -669,7 +671,7 @@ Feature: SandboxController
 ---
 
 ### C14 ControlEndpoint
-**File:** `src/endpoint.rs` | **Dependencies:** ClientAuth, SessionManager, SandboxController · **derivedFromHld:** 0.4.1
+**File:** `src/endpoint.rs` | **Dependencies:** ClientAuth, SessionManager, SandboxController · **derivedFromHld:** 0.4.2
 
 **Purpose.** Listen on the local socket; authenticate each connection (C6); bind a session (C7); accept the single `run` entry over the faraday-native RPC; stream results; emit `interaction_required`. Never network-bound. The MCP front door is the separate `mcp-stdio` sub-mode (C16), which connects here as an ordinary authenticated client (ADR-028) — the endpoint itself serves only the native RPC.
 
@@ -710,7 +712,7 @@ Feature: ControlEndpoint
 ---
 
 ### C16 McpFrontDoor
-**File:** `src/mcp.rs` (the `faradayd mcp-stdio` sub-mode) | **Dependencies:** (client of) ControlEndpoint C14 over the control socket; the connection-token file | **derivedFromHld:** 0.4.1 · **(security-relevant — ADR-028)**
+**File:** `src/mcp.rs` (the `faradayd mcp-stdio` sub-mode) | **Dependencies:** (client of) ControlEndpoint C14 over the control socket; the connection-token file | **derivedFromHld:** 0.4.2 · **(security-relevant — ADR-028)**
 
 **Purpose.** The MCP front door (ADR-028): an MCP server speaking **JSON-RPC 2.0 over stdin/stdout** that an MCP client (Claude Code / IDE) launches per session via `faradayd mcp-stdio`. It exposes exactly **one** tool, `python_sandbox`, and translates `tools/call` into a `connect`+`run` on the daemon's control socket. It is on the **untrusted client side** of the ADR-024 boundary: it holds no tokens, carries only `{code, requestedCapabilities}` out / sanitised JSON back, and is the same binary as the daemon (version-locked, ADR-026).
 
@@ -755,7 +757,7 @@ Feature: McpFrontDoor (mcp-stdio)
 ---
 
 ### pysandbox_sdk
-**File:** `sdk/pysandbox_sdk/__init__.py` (guest Python) | **derivedFromHld:** 0.4.1
+**File:** `sdk/pysandbox_sdk/__init__.py` (guest Python) | **derivedFromHld:** 0.4.2
 
 **Purpose.** The only egress path for guest code, implemented over the single WASM host import the runtime links. Shape only (no other capability exists).
 
@@ -796,3 +798,60 @@ Feature: pysandbox_sdk
     Then PermissionError is raised and no host import occurs
 ```
 **Gaps.** None.
+
+---
+
+### C18 CredentialCli
+**File:** `src/credential.rs` (logic) + `src/main.rs` (subcommand dispatch) | **Dependencies:** Config, PolicyEngine, OS-keychain crate · **derivedFromHld:** 0.4.2 · **(new — ADR-040)**
+
+> **Classification: [Not implemented] (ADR-040 — no code yet).** Every assertion below is a remediation target for `codegen`; no `faradayd credential` surface exists in the source.
+
+**Purpose.** Provision, remove, and list per-capability `api_key` secrets (ADR-036) in the **OS secure store**, so a user enrols an admin-issued token once for a `keychain`-resolver capability (ADR-040). Runs as the `faradayd credential <verb>` subcommand — matching the existing `faradayd mcp-stdio` / `faradayd install-mcp-config` dispatch in `main.rs` — and writes through the **same** OS-keychain integration `KeychainSecretResolver` (C1) reads, so enrolment and resolution cannot disagree. Secret values are never printed, logged, or passed as a command-line argument.
+
+**Public Interface.**
+- `faradayd credential set <secretRef>` — read the token from **stdin** (no-echo prompt to stderr when stdin is a TTY; piped bytes otherwise, for automation), write it to the OS store under `(service = PYS_KEYCHAIN_SERVICE, account = <secretRef>)`. Overwrite = rotation.
+- `faradayd credential rm <secretRef>` — delete the entry.
+- `faradayd credential list` — print provisioned `secretRef`s (accounts) under the service, **names only, never values**.
+- `pub fn run_credential(args: &[String], cfg: &Config, policy: &Manifest, keychain: &dyn KeychainStore) -> Result<(), CredentialError>` — dispatched from `main.rs`; `KeychainStore` is the write/delete/list counterpart of the C1 `KeychainSecretResolver` read path (same `(service, account)` mapping).
+
+**Internal Logic.**
+1. Parse the verb (`set` | `rm` | `list`); unknown or missing → `CRED_USAGE` (usage to stderr, non-zero exit). The secret is **never** accepted as an argv element.
+2. Load `Config` for `PYS_KEYCHAIN_SERVICE`; the store operated on is `(service = PYS_KEYCHAIN_SERVICE)`.
+3. **`set <secretRef>`:** validate `<secretRef>` names an `api_key` capability in the admin-signed manifest (`PolicyEngine.load`, ADR-021) — an unknown/unauthorised ref → `CRED_UNKNOWN_REF`, nothing written. Read the token from stdin (no-echo when a TTY; otherwise the piped bytes); trim a single trailing newline; empty → `CRED_EMPTY`. Write to `(service, account = secretRef)`; on backend failure → `CRED_KEYCHAIN`. Confirm success to stderr naming the ref only.
+4. **`rm <secretRef>`:** delete `(service, account = secretRef)`; absent → `CRED_NOT_FOUND`; backend failure → `CRED_KEYCHAIN`.
+5. **`list`:** enumerate accounts under the service; print ref names only. Backend failure → `CRED_KEYCHAIN`.
+6. No secret value is ever written to stdout, stderr, logs, or a trace; every failure exits non-zero.
+
+**Error Table.**
+| Condition | Code | Effect |
+|---|---|---|
+| unknown verb / missing arg | CRED_USAGE | usage to stderr; non-zero exit |
+| `secretRef` is not an `api_key` capability in the signed manifest | CRED_UNKNOWN_REF | error; non-zero exit; nothing written |
+| empty token on `set` | CRED_EMPTY | error; non-zero exit |
+| `rm`/`list` on a missing entry (`rm` only) | CRED_NOT_FOUND | error; non-zero exit |
+| OS-keychain write/read/delete failure | CRED_KEYCHAIN | error; non-zero exit |
+
+**Gherkin.**
+```gherkin
+Feature: CredentialCli
+  Scenario: Happy path — set writes the token to the OS store without echoing it
+    Given an api_key capability weather.key in the signed manifest
+    When `faradayd credential set weather.key` receives a token on stdin
+    Then the token is stored under (PYS_KEYCHAIN_SERVICE, weather.key) and never printed
+  Scenario: Error — set rejects an unknown secretRef
+    Given no capability named unknown.ref in the manifest
+    When `faradayd credential set unknown.ref` is run
+    Then it exits non-zero with CRED_UNKNOWN_REF and writes nothing
+  Scenario: Error — set rejects an empty token
+    When `faradayd credential set weather.key` receives empty stdin
+    Then it exits non-zero with CRED_EMPTY
+  Scenario: Edge — rm deletes the entry
+    Given weather.key is provisioned
+    When `faradayd credential rm weather.key` is run
+    Then the entry is removed and a later resolve returns CFG_SECRET_UNRESOLVED
+  Scenario: Edge — list shows names only
+    Given weather.key is provisioned
+    When `faradayd credential list` is run
+    Then it prints weather.key and no token value
+```
+**Gaps.** None blocking. The exact per-OS keychain entry attributes (label, access-control flags) are confirmed against the chosen OS-keychain crate at build (Playbook Step 9). MDM / configuration-management push is an **alternative external provisioning path** (ADR-040), out of this component's scope.

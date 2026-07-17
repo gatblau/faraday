@@ -63,7 +63,7 @@ An `api_key` capability (either kind) carries these two fields and needs no `pro
 
 | Field | Type | Required | Meaning and constraints |
 |---|---|---|---|
-| `secretRef` | string (≥1) | yes *(api_key)* | The `SecretResolver` reference for this capability's key — a file path under `FileSecretResolver` (the `*_REF` → file convention). Read once at startup, never logged, never returned to the guest. Required for `authMode: api_key`; forbidden otherwise. |
+| `secretRef` | string (≥1) | yes *(api_key)* | The `SecretResolver` reference for this capability's key, interpreted by the active resolver (`PYS_SECRET_RESOLVER`): a **file path** under `FileSecretResolver` (the `*_REF` → file convention), or a **keychain account** under `PYS_KEYCHAIN_SERVICE` under `KeychainSecretResolver` (ADR-040). Read once at startup, never logged, never returned to the guest. Required for `authMode: api_key`; forbidden otherwise. |
 | `keyPlacement` | object (`header` or `query`) | yes *(api_key)* | How the resolved key is attached to the outbound request. `{ "header": { "name": "<h>", "scheme"?: "<s>" } }` → `<h>: [<s> ]<key>` (scheme optional, e.g. `Token`); or `{ "query": { "param": "<p>" } }` → `?<p>=<key>`. The mode does **not** assume `Authorization: Bearer`. Required for `authMode: api_key`; forbidden otherwise. |
 
 ## `defaults` object

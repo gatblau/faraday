@@ -53,6 +53,7 @@ Build order is the dependency DAG (leaves first). All components are Rust module
 | C15 | HealthCheck (liveness/readiness over the control socket) | `health` | 4 (cross-cutting) | IdentityBroker (dep reachability) | Low |
 | C16 | McpFrontDoor (`faradayd mcp-stdio` sub-mode — MCP stdio server; untrusted client of C14, ADR-028) | `mcp` | 3 | (client of) ControlEndpoint over the control socket; the connection-token file | High |
 | C17 | McpUpstreamClient (outbound MCP **client** — JSON-RPC `tools/call` over HTTP/SSE to allowlisted downstream MCP servers, ADR-034) | `mcp_upstream` | 3 | Config | Medium |
+| C18 | CredentialCli (`faradayd credential set\|rm\|list` — enrol/remove/list `api_key` keychain secrets, ADR-040) | `credential` | 3 | Config, PolicyEngine, OS-keychain crate | Low |
 | — | `pysandbox_sdk` (guest Python module — contract surface) | `sdk/` (Python) | 3 | the single WASM host import (C12) | Low |
 
 DAG check: C1 has no deps; C2,C3,C4,C5,C6,C7,C8,C9,C10,C17 depend only on C1 (+ external); C11 on C1/C3/C4/C5/C9/C10/C17; C12 on C1/C11; C13 on C11/C12/C4/C8/C7/C3; C14 on C6/C7/C13; C15 on C11; **C16 is a separate process (the `mcp-stdio` sub-mode) that connects to C14 as an ordinary authenticated client — no in-process dependency, so it does not affect the build DAG**. No cycles (leaves → C11 → C12 → C13 → C14). C17 (the outbound MCP client) is a leaf alongside C10, consumed by C11 — not to be confused with C16 (the inbound MCP front door).
@@ -206,6 +207,8 @@ pub struct WireError { pub error: String, pub code: String /* UPPER_SNAKE; regis
 | `PYS_SOCKET_PATH` | string | `$XDG_RUNTIME_DIR/faradayd.sock` (UDS) / `\\.\pipe\faradayd-<uid>` (Windows) | No | Config | Control-socket path; created `0600` / per-user-SID ACL. |
 | `PYS_CONNECTION_TOKEN_PATH` | string | `$XDG_RUNTIME_DIR/faradayd.token` | No | Config | `0600` file the daemon writes the per-launch connection token to (ADR-024). |
 | `PYS_REQUIRE_FIRST_CONNECT_CONSENT` | bool | `true` | No | Config | Whether a new client identity must pass a first-connect consent (ADR-024 / OQ-A). |
+| `PYS_SECRET_RESOLVER` | enum `file` \| `keychain` | `file` | No | Config | **[Not implemented] (ADR-040).** Selects the `SecretResolver` backend for `*_REF` config secrets and `api_key` `secretRef`s: `file` (`FileSecretResolver`) or `keychain` (`KeychainSecretResolver`, OS secure store). Unknown value → `CFG_INVALID`. |
+| `PYS_KEYCHAIN_SERVICE` | string | `faradayd` | No | Config | **[Not implemented] (ADR-040).** OS-keychain *service* name under which `KeychainSecretResolver` (C1) reads and `CredentialCli` (C18) writes an `api_key` key; the `secretRef` is the keychain *account*. Used only when `PYS_SECRET_RESOLVER=keychain`. |
 | `PYS_OIDC_ISSUER` | string | — | Yes | Config | OIDC issuer for user sign-in (no default IdP — Okta/Keycloak/Entra/Dex); the daemon does generic discovery at `<issuer>/.well-known/openid-configuration` (ADR-029). |
 | `PYS_OIDC_CLIENT_ID` | string | — | Yes | Config | OIDC **public client** id for the browser auth-code + PKCE sign-in (ADR-029). No client secret on the workstation. |
 | `PYS_OIDC_SCOPES` | string | `openid profile email` | No | Config | Space-separated scopes requested at sign-in. |

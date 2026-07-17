@@ -29,3 +29,10 @@ One line per HLD revision bump (folder-form requirement, D-HLD-6).
 > Reconciled in place (code → spec via `/sync-spec`) so the prose, the JSON schema, and the code
 > agree. A correction of docs that lagged an already-decided taxonomy — so **no revision bump and
 > no spec `derivedFromHld` re-pin**.
+
+- **0.4.2** (2026-07-17) — ADR-040: keychain-backed `SecretResolver` for `api_key`. Adds
+  `KeychainSecretResolver` (C1) selected by `PYS_SECRET_RESOLVER`, the `PYS_KEYCHAIN_SERVICE`
+  env var, and a new **C18 CredentialCli** (`faradayd credential set|rm|list`) for self-service
+  per-user enrolment (resolves OQ-KC-1). The `api_key` auth mode / `secretRef` / `keyPlacement`
+  (ADR-036) are unchanged. All new assertions are [Not implemented] (no code yet). All component
+  pins re-pinned 0.4.1 → 0.4.2.
