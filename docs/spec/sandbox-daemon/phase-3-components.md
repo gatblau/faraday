@@ -33,14 +33,14 @@ All components are Rust modules in one binary (HLD ADR-026). Each carries Public
 - `pub fn load(env: &dyn Env, resolver: &dyn SecretResolver) -> Result<Config, ConfigError>` — parse, resolve `*_REF` secrets, validate; return an immutable `Config` or the first invalid field.
 - `pub trait SecretResolver { fn resolve(&self, reference: &str) -> Result<Vec<u8>, ConfigError>; }` — the secret-resolution SPI. Resolves both `PYS_*_REF` config secrets and each `api_key` capability's `secretRef` (ADR-036).
 - `pub struct FileSecretResolver` (impl `SecretResolver`) — the default resolver: treats the reference as a file path and reads its bytes (`CFG_SECRET_UNRESOLVED` on failure), matching the repo `*_REF` → file convention.
-- `pub struct KeychainSecretResolver` (impl `SecretResolver`) — **[Not implemented] (ADR-040 — no code yet).** Resolves a reference from the **OS secure store** (macOS Keychain, Windows Credential Manager, Linux Secret Service) via the OS-keychain crate, looking up the entry `(service = PYS_KEYCHAIN_SERVICE, account = reference)`; `CFG_SECRET_UNRESOLVED` if the entry is absent. The active resolver is selected once at startup by `PYS_SECRET_RESOLVER` (`file` default | `keychain`) and injected into `load` and the C11 `ApiKeyStore` freeze, so an `api_key` capability's `secretRef` resolves from the chosen backend uniformly — the auth mode, `secretRef`, and `keyPlacement` (ADR-036) are unchanged, only the key's origin differs.
+- `pub struct KeychainSecretResolver` (impl `SecretResolver`; in `src/keychain.rs`, ADR-040) — resolves a reference from the **OS secure store** (macOS Keychain, Windows Credential Manager, Linux Secret Service) via the `keyring` crate, looking up the entry `(service = PYS_KEYCHAIN_SERVICE, account = reference)`; `CFG_SECRET_UNRESOLVED` if the entry is absent or on a backend fault (fail closed). The active resolver is selected once at startup (`keychain::resolver_kind` / `build_resolver`, called from `main.rs`) and injected into `Config::load` and `broker::freeze_api_keys`, so an `api_key` capability's `secretRef` resolves from the chosen backend uniformly — the auth mode, `secretRef`, and `keyPlacement` (ADR-036) are unchanged, only the key's origin differs.
 
 **Internal Logic.**
 1. Read every Phase-2D variable; apply defaults where unset.
 2. Resolve each `*_REF` via `resolver`; on error → `CFG_SECRET_UNRESOLVED`.
 3. Validate: `PYS_OIDC_ISSUER` is an `https` URL (loopback `http://127.0.0.1`/`http://localhost` permitted — ADR-029); `PYS_RESPONSE_MAX_BYTES` ≤ 1 MiB; budgets ≥ 1; `PYS_GUEST_ARTIFACT_DIGEST` non-empty; `PYS_ALLOW_PLAINTEXT_LOOPBACK_EGRESS` is a bool (default `false`) — when `true`, C10 may use `http` for a `127.0.0.1` provider host only (ADR-032); if any capability uses a token-exchange provider then `PYS_OBO_ENDPOINT` is set; in real-credential mode `PYS_OTLP_ENDPOINT` is set (else degrade to mock per ADR-016). On failure → `CFG_INVALID` naming the field.
 4. Return an immutable `Config`; log resolved non-secret fields at `info`; never log secret values.
-5. **Resolver selection (ADR-040, [Not implemented]).** `PYS_SECRET_RESOLVER` (`file` default | `keychain`) selects the `SecretResolver` implementation constructed at startup and injected here and into the C11 `ApiKeyStore` freeze. `secretRef` is interpreted by the active resolver — a file path for `FileSecretResolver`, a keychain account under `PYS_KEYCHAIN_SERVICE` for `KeychainSecretResolver`. An unknown `PYS_SECRET_RESOLVER` value fails closed (`CFG_INVALID`).
+5. **Resolver selection (ADR-040).** `keychain::resolver_kind` reads `PYS_SECRET_RESOLVER` (`file` default | `keychain`) and `PYS_KEYCHAIN_SERVICE`; `keychain::build_resolver` constructs the `SecretResolver` at startup (from `main.rs`), injected into `Config::load` and `broker::freeze_api_keys`. `secretRef` is interpreted by the active resolver — a file path for `FileSecretResolver`, a keychain account under `PYS_KEYCHAIN_SERVICE` for `KeychainSecretResolver`. An unknown `PYS_SECRET_RESOLVER` value fails closed (`CFG_INVALID`).
 
 **Error Table.**
 | Condition | Code | Effect |
@@ -804,7 +804,7 @@ Feature: pysandbox_sdk
 ### C18 CredentialCli
 **File:** `src/credential.rs` (logic) + `src/main.rs` (subcommand dispatch) | **Dependencies:** Config, PolicyEngine, OS-keychain crate · **derivedFromHld:** 0.4.2 · **(new — ADR-040)**
 
-> **Classification: [Not implemented] (ADR-040 — no code yet).** Every assertion below is a remediation target for `codegen`; no `faradayd credential` surface exists in the source.
+> **Status: implemented (ADR-040).** `src/credential.rs` (core: `parse_cmd` + `run_credential` + `CredentialCmd` + `CredentialError`) and `src/main.rs` (`credential` dispatch → `run_credential_cli`, the no-echo token read, and printing).
 
 **Purpose.** Provision, remove, and list per-capability `api_key` secrets (ADR-036) in the **OS secure store**, so a user enrols an admin-issued token once for a `keychain`-resolver capability (ADR-040). Runs as the `faradayd credential <verb>` subcommand — matching the existing `faradayd mcp-stdio` / `faradayd install-mcp-config` dispatch in `main.rs` — and writes through the **same** OS-keychain integration `KeychainSecretResolver` (C1) reads, so enrolment and resolution cannot disagree. Secret values are never printed, logged, or passed as a command-line argument.
 
@@ -812,7 +812,10 @@ Feature: pysandbox_sdk
 - `faradayd credential set <secretRef>` — read the token from **stdin** (no-echo prompt to stderr when stdin is a TTY; piped bytes otherwise, for automation), write it to the OS store under `(service = PYS_KEYCHAIN_SERVICE, account = <secretRef>)`. Overwrite = rotation.
 - `faradayd credential rm <secretRef>` — delete the entry.
 - `faradayd credential list` — print provisioned `secretRef`s (accounts) under the service, **names only, never values**.
-- `pub fn run_credential(args: &[String], cfg: &Config, policy: &Manifest, keychain: &dyn KeychainStore) -> Result<(), CredentialError>` — dispatched from `main.rs`; `KeychainStore` is the write/delete/list counterpart of the C1 `KeychainSecretResolver` read path (same `(service, account)` mapping).
+- `pub enum CredentialCmd { Set { secret_ref: String, token: Vec<u8> }, Rm { secret_ref: String }, List }` — the parsed command. Intentionally **not** `Debug`-derived (it holds the token).
+- `pub fn parse_cmd(args: &[String], read_token: impl FnOnce() -> Result<Vec<u8>, CredentialError>) -> Result<CredentialCmd, CredentialError>` — parse `[verb, secretRef?]`; the token for `set` comes from `read_token` (read no-echo from stdin by `main.rs`), never from argv.
+- `pub fn run_credential(cmd: CredentialCmd, service: &str, policy: &PolicyEngine, keychain: &dyn KeychainStore) -> Result<Vec<String>, CredentialError>` — execute against the OS store; returns the lines to print (never a secret value). A `set` is rejected unless its `secretRef` ∈ `policy.api_key_secret_refs()`. `KeychainStore` (in `src/keychain.rs`) is the write/delete/list counterpart of the C1 `KeychainSecretResolver` read path (same `(service, account)` mapping).
+- `main.rs::run_credential_cli` (the shell) — reads `PYS_KEYCHAIN_SERVICE` and the manifest, reads the token no-echo via `rpassword` on a TTY (piped bytes otherwise), calls `parse_cmd` + `run_credential`, and prints the result lines or the `CRED_*` error.
 
 **Internal Logic.**
 1. Parse the verb (`set` | `rm` | `list`); unknown or missing → `CRED_USAGE` (usage to stderr, non-zero exit). The secret is **never** accepted as an argv element.
