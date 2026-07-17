@@ -4,6 +4,8 @@ The capability manifest `pysandbox.policy.json` is the **authorisation taxonomy*
 
 > **Schema-file status (ADR-034).** The `mcp` capability kind is encoded in the JSON Schema file: `kind` (discriminator, default `rest`), `serverUrl`, and `toolAllow`, with the kind/allowlist mutual-exclusion of rule 6 and the HTTPS-only/loopback constraint of rule 7 expressed as `if/then`/`pattern`. The LLD component specs for the kind live in `docs/spec/sandbox-daemon/` (C4 `authorise_tool`, C5 `sanitize_mcp`, C17 `McpUpstreamClient`, C11 `call_tool`, C12 tagged host import, `pysandbox_sdk` `mcp.<capability>.call_tool`).
 
+> **Schema-file status (ADR-036/037/039).** The JSON Schema file also encodes the per-capability **`authMode`** discriminator (`exchange` (default) · `passthrough` · `none` · `api_key`), the api_key fields **`secretRef`** + **`keyPlacement`**, and the write-gate flag **`allowWrite`**. These decisions are recorded in the **shared daemon ADR register** — ADR-036 (`api_key`), ADR-037 (`none`), ADR-039 (write gate) — which lives in [`../faradayd-server-mode/09-decisions.md`](../faradayd-server-mode/09-decisions.md); the sandbox-daemon and server-mode HLD folders share one ADR number space for the daemon (the next free number is ADR-040). The routing is implemented in `broker.rs` (auth-mode `match`) and validated at load in `policy.rs` (C4). This page documents them below.
+
 This supersedes the pre-pivot schema once held in the retired `design.md` §17 (which still named `provider` values `microsoft`/`msal-obo`). The current taxonomy is **provider-pluggable** with no default IdP (obo-broker ADR-009/ADR-017): the generic `rfc8693` plugin is the reference baseline.
 
 ## Top-level structure
@@ -28,19 +30,23 @@ Every capability has a **`kind`** that selects its shape and therefore which all
 |---|---|---|---|
 | `kind` | enum `rest` \| `mcp` (default `rest`) | no | `rest` mediates a REST/HTTP API by host + path + method; `mcp` mediates a downstream MCP server over HTTP/SSE transport by server origin + tool name (ADR-034). A capability that omits `kind` is `rest`, so manifests written before ADR-034 are unchanged. |
 
-`provider`, `scopes`, `audience`, and `requireStepUpAuth` are **shared** by both kinds. The allowlist fields differ: `rest` uses `host` + `pathAllow` + `methods`; `mcp` uses `serverUrl` + `toolAllow`.
+`authMode`, `provider`, `scopes`, `audience`, `requireStepUpAuth`, and `allowWrite` are **shared** by both kinds; the api_key-only fields `secretRef` + `keyPlacement` are shared too (valid on either kind when `authMode: api_key`). The allowlist fields differ: `rest` uses `host` + `pathAllow` + `methods`; `mcp` uses `serverUrl` + `toolAllow`.
+
+**`authMode` selects how the broker credentials the downstream call** (ADR-036/037): `exchange` (default when omitted) routes via the obo-broker token exchange; `passthrough` forwards the user's OIDC access token (admin-signed manifests only); `none` sends no credential (still allowlist/budget/audit-bound); `api_key` applies a per-capability static key. `provider`/`audience`/`scopes` are meaningful only for `exchange`/`passthrough`; `none` and `api_key` need none of them.
 
 ### Shared and REST fields (`kind: "rest"`)
 
 | Field | Type | Required | Meaning and constraints |
 |---|---|---|---|
-| `provider` | string `^[a-z0-9][a-z0-9-]*$` | yes | `providerId` of an in-tree, security-reviewed Provider Plugin (obo-broker ADR-009), selected per capability by the Provider Registry. Plugins are compiled in, never dynamically loaded. Known values: `rfc8693` (RFC 8693 token exchange), `github` (OAuth). An unknown provider fails closed at load. Shared by both kinds. |
-| `scopes` | string[] (≥1, unique) | yes | **Advisory only.** The issued token may carry broader scopes, and per-call downscoping is not generally available. Never treat `scopes` as a boundary. Shared by both kinds. |
+| `authMode` | enum `exchange` \| `passthrough` \| `none` \| `api_key` (default `exchange`) | no | How the broker credentials the downstream call (ADR-036/037). `exchange` → obo-broker token exchange; `passthrough` → forward the user's OIDC access token (admin-signed only); `none` → no credential (ADR-037); `api_key` → per-capability static key (ADR-036). Absent ⇒ `exchange`. Shared by both kinds. |
+| `provider` | string `^[a-z0-9][a-z0-9-]*$` | conditional | `providerId` of an in-tree, security-reviewed Provider Plugin (obo-broker ADR-009), selected per capability by the Provider Registry. Plugins are compiled in, never dynamically loaded. Known values: `rfc8693` (RFC 8693 token exchange), `github`. **Required for `authMode` `exchange`/`passthrough`; ignored for `none`/`api_key`.** An unknown provider fails closed at load. Shared by both kinds. |
+| `scopes` | string[] (≥1, unique) | conditional | **Advisory only.** The issued token may carry broader scopes, and per-call downscoping is not generally available. Never treat `scopes` as a boundary. Required for `exchange`/`passthrough`; omit for `none`/`api_key`. Shared by both kinds. |
 | `host` | string (hostname) | yes *(rest)* | Exactly **one** allowlisted host. The broker pins outbound calls to it, does not auto-follow cross-origin redirects, and never re-sends `Authorization` across a host boundary. No wildcards. **REST only** — absent on an `mcp` capability (use `serverUrl`). |
-| `audience` | string (≥1) | conditional | Downstream API audience for token exchange. **Required for token-exchange providers** (`provider=rfc8693` and equivalents); omit for non-exchange providers such as `github`. The schema enforces the `rfc8693` case structurally; the broker enforces the rule for every token-exchange plugin at load. Shared by both kinds. |
+| `audience` | string (≥1) | conditional | Downstream API audience for token exchange. **Required for token-exchange providers** (`authMode: exchange`, `provider=rfc8693` and equivalents); omit for `passthrough`, `none`, and `api_key`. The schema enforces the `rfc8693` case structurally; the broker enforces the rule for every token-exchange plugin at load. Shared by both kinds. |
 | `pathAllow` | string[] regex (≥1) | yes *(rest)* | Anchored regexes matched against the **canonicalised** path (decoded; `.`/`..` resolved; `//` collapsed), excluding the query string. A path still containing `..` after canonicalisation is rejected before matching. **REST only** — absent on an `mcp` capability (use `toolAllow`). |
 | `methods` | enum[] (≥1, unique) | yes *(rest)* | Subset of `GET`, `POST`, `PATCH`, `PUT`, `DELETE`. The SDK currently exposes get/post/patch/delete; `PUT` is accepted in policy for forward compatibility. **REST only** — absent on an `mcp` capability (the MCP transport is always a `tools/call` POST). |
-| `requireStepUpAuth` | boolean (default `false`) | no | When `true`, the broker requires a stepped-up `id_token` `acr` (obo-broker ADR-014) and otherwise returns an RFC 9470 challenge; the daemon steps up (via its consent UI) and retries once (ADR-015). Recommended `true` for write capabilities. Shared by both kinds. |
+| `requireStepUpAuth` | boolean (default `false`) | no | When `true`, the broker requires a stepped-up `id_token` `acr` (obo-broker ADR-014) and otherwise returns an RFC 9470 challenge; the daemon steps up (via its consent UI) and retries once (ADR-015). Recommended `true` for write capabilities. **Not applicable to `authMode` `api_key`/`none`** (those modes carry no user `acr`) — rejected at load if set. Shared by both kinds. |
+| `allowWrite` | boolean (default `false`) | no | Write gate (ADR-039): a capability is read-only (may declare only `GET`) unless this is `true`; honoured only in an admin-signed manifest (ADR-021). An unsafe method (`POST`/`PUT`/`PATCH`/`DELETE`) without `allowWrite` is rejected fail-closed at load. Enforced for every manifest, all deployment profiles. Shared by both kinds. |
 
 ### MCP fields (`kind: "mcp"`)
 
@@ -50,6 +56,15 @@ A `kind: "mcp"` capability carries the shared fields above (`provider`, `scopes`
 |---|---|---|---|
 | `serverUrl` | string (https URI) | yes *(mcp)* | The single allowlisted downstream MCP server origin. The broker pins each `tools/call` to it over HTTPS, does not auto-follow cross-origin redirects, and never re-sends the credential across a host boundary — the `host` rules of a `rest` capability, applied to the MCP transport. HTTP/SSE transport only; loopback plaintext follows ADR-032. A non-HTTP transport (stdio) is not expressible (ADR-034 / threat-model RR-10). |
 | `toolAllow` | string[] (≥1, unique) | yes *(mcp)* | The exact downstream tool names the agent may call via `mcp.<capability-id>.call_tool(name, ...)`. A tool the server advertises through `tools/list` but absent from `toolAllow` is unreachable, fail-closed — the server's advertised list is never the authorisation surface (ADR-034). The allowlist is over tool **names only**; per-argument constraints are deferred to `/spec` and, when added, extend this field without a schema break. |
+
+### api_key fields (`authMode: "api_key"`, ADR-036)
+
+An `api_key` capability (either kind) carries these two fields and needs no `provider`/`audience`/`scopes` (unused) and no `requireStepUpAuth` (rejected). The key is resolved once at startup via the `SecretResolver` (C1) and frozen for the daemon's life; it is applied by the broker (C11 → C10) and never returned to the guest or written to the audit trail.
+
+| Field | Type | Required | Meaning and constraints |
+|---|---|---|---|
+| `secretRef` | string (≥1) | yes *(api_key)* | The `SecretResolver` reference for this capability's key — a file path under `FileSecretResolver` (the `*_REF` → file convention). Read once at startup, never logged, never returned to the guest. Required for `authMode: api_key`; forbidden otherwise. |
+| `keyPlacement` | object (`header` or `query`) | yes *(api_key)* | How the resolved key is attached to the outbound request. `{ "header": { "name": "<h>", "scheme"?: "<s>" } }` → `<h>: [<s> ]<key>` (scheme optional, e.g. `Token`); or `{ "query": { "param": "<p>" } }` → `?<p>=<key>`. The mode does **not** assume `Authorization: Bearer`. Required for `authMode: api_key`; forbidden otherwise. |
 
 ## `defaults` object
 
@@ -83,6 +98,8 @@ The JSON Schema validates shape; the broker enforces these cross-field and seman
 5. **`pathAllow` patterns must be anchored and are matched against the canonicalised path.** An unanchored pattern is accepted by the schema (it is still a valid regex) but is a privilege-escalation hazard — see [12 — Authoring Guide](./12-authoring-guide.md).
 6. **Allowlist fields must match `kind`.** A `rest` capability (or one omitting `kind`) MUST carry `host`/`pathAllow`/`methods` and MUST NOT carry `serverUrl`/`toolAllow`; an `mcp` capability MUST carry `serverUrl`/`toolAllow` and MUST NOT carry `host`/`pathAllow`/`methods`. A mismatched capability is rejected at load (ADR-034).
 7. **`mcp` capabilities are HTTP/SSE transport only.** `serverUrl` MUST be an `https` origin (or an ADR-032 loopback `http` origin under the dev opt-in). stdio-transport downstream MCP is not expressible and is out of scope (ADR-034 / threat-model RR-10).
+8. **`authMode` field coherence (ADR-036/037).** `exchange`/`passthrough` require a `provider`; `api_key` requires `secretRef` + `keyPlacement`, and both are forbidden on any other mode; `requireStepUpAuth` is rejected on `api_key`/`none`; an `mcp` capability with `authMode: exchange` is rejected (ADR-034 amendment — the obo-broker cannot drive a `tools/call`). Each fails closed at load with `CFG_INVALID` naming the capability.
+9. **Write gate (ADR-039).** A capability declaring any unsafe method (`POST`/`PUT`/`PATCH`/`DELETE`) without `allowWrite: true` is rejected fail-closed at load. `allowWrite` is honoured only in an admin-signed manifest (ADR-021); it is enforced for every manifest, all deployment profiles.
 
 ## Validation behaviour (errors are first-class)
 
@@ -123,6 +140,14 @@ The JSON Schema validates shape; the broker enforces these cross-field and seman
       "scopes": ["Tickets.Read"],
       "serverUrl": "https://tickets-mcp.example.com/mcp",
       "toolAllow": ["search_tickets", "get_ticket"]
+    },
+    "weather.current": {
+      "authMode": "api_key",
+      "secretRef": "/etc/faradayd/secrets/weather.key",
+      "keyPlacement": { "header": { "name": "X-API-Key" } },
+      "host": "api.weather.example.com",
+      "pathAllow": ["^/v1/current$"],
+      "methods": ["GET"]
     }
   },
   "defaults": {

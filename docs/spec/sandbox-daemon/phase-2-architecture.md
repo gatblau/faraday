@@ -25,7 +25,7 @@ graph TB
   s -->|"OIDC sign-in / step-up"| idp
   s -->|"read tokens"| keychain
   s -->|"user id_token → POST /v1/exchange"| obo
-  s -->|"HTTPS + Bearer (direct providers, host-allowlisted, no cross-origin redirect)"| apis
+  s -->|"HTTPS + credential (passthrough Bearer / api_key header|query / none; host-allowlisted, no cross-origin redirect)"| apis
   obo -->|"HTTPS + downstream Bearer"| apis
   s -->|"OTLP audit/metrics"| siem
 ```
@@ -45,8 +45,8 @@ Build order is the dependency DAG (leaves first). All components are Rust module
 | C7 | SessionManager | `session` | 3 | Config | Medium |
 | C8 | ConsentUI / InteractionBroker | `interaction` | 3 | Config | High |
 | C9 | OboClient (backend exchange) | `obo` | 3 | Config | Medium |
-| C10 | DownstreamClient (direct providers) | `downstream` | 3 | Config | Medium |
-| C11 | IdentityBroker (token vault, capability table, egress, OBO/direct/MCP, OIDC sign-in) | `broker` | 3 | Config, AuditLogger, PolicyEngine, ResponseSanitizer, OboClient, DownstreamClient, McpUpstreamClient, keychain | High |
+| C10 | DownstreamClient (non-exchange modes: passthrough/api_key/none) | `downstream` | 3 | Config | Medium |
+| C11 | IdentityBroker (token vault, capability table, egress, authMode routing exchange/passthrough/api_key/none + MCP, OIDC sign-in) | `broker` | 3 | Config, AuditLogger, PolicyEngine, ResponseSanitizer, OboClient, DownstreamClient, McpUpstreamClient, CredentialSource, ApiKeyStore | High |
 | C12 | SandboxRuntime (Wasmtime + RustPython, single host import) | `runtime` | 3 | Config, IdentityBroker | High |
 | C13 | SandboxController (run lifecycle, capability bundle, redaction, interaction routing) | `controller` | 3 | IdentityBroker, SandboxRuntime, PolicyEngine, ConsentUI, SessionManager, AuditLogger | High |
 | C14 | ControlEndpoint (native-RPC listener; cross-platform UDS `0600` + peer-UID / named pipe + per-user-SID, ADR-030) | `endpoint` | 3 | ClientAuth, SessionManager, SandboxController | High |
@@ -105,11 +105,29 @@ pub struct Session { pub client: ClientIdentity, pub workspace_id: String, pub c
 pub enum CapabilityKind { Rest, Mcp }
 // Used by: PolicyEngine (C4), IdentityBroker (C11), SandboxController (C13), ConsentUI (C8).
 
+// AuthMode — how the broker obtains the credential it presents downstream for a capability.
+// Wire tokens (serde): exchange | passthrough | none | api_key. Absent field ⇒ Exchange.
+pub enum AuthMode {
+    Exchange,        // token exchange via obo-broker (C9); downstream token minted server-side (default)
+    Passthrough,     // forward the user's OIDC access_token as a Bearer (C10); admin-signed manifests only
+    Unauthenticated, // wire `none` (ADR-037): no credential sent; still allowlist/budget/audit-bound
+    ApiKey,          // wire `api_key` (ADR-036): a per-capability static key applied by the broker (C10)
+}
+// Used by: PolicyEngine (C4), IdentityBroker (C11).
+
+// KeyPlacement — how an api_key capability's resolved key is attached to the outbound request (ADR-036).
+// Wire tokens (serde): header | query.
+pub enum KeyPlacement {
+    Header { name: String, scheme: Option<String> }, // `<name>: [<scheme> ]<key>` (scheme optional, e.g. "Token")
+    Query { param: String },                          // `?<param>=<key>`
+}
+// Used by: PolicyEngine (C4), IdentityBroker (C11), DownstreamClient (C10).
+
 // ResolvedCapability — a manifest entry after lookup. The kind selects which allowlist
 // fields are populated: Rest → host/path_allow/methods; Mcp → server_url/tool_allow (ADR-034).
 pub struct ResolvedCapability {
     pub id: String, pub kind: CapabilityKind,
-    pub provider: String,                    // e.g. "rfc8693" (OBO) | "github" (direct)
+    pub provider: String,                    // IdP-plugin id for exchange/passthrough (e.g. "rfc8693"|"github"); ignored for none/api_key
     pub audience: Option<String>, pub scopes: Vec<String>,
     // Rest kind (empty/None for Mcp):
     pub host: String, pub path_allow: Vec<regex::Regex>, pub methods: Vec<String>,
@@ -117,6 +135,10 @@ pub struct ResolvedCapability {
     pub server_url: Option<String>,          // single allowlisted MCP server origin (HTTPS / loopback)
     pub tool_allow: Vec<String>,             // permitted downstream tool names (the toolAllow set)
     pub require_step_up: bool,
+    pub auth_mode: AuthMode,                  // credential mode (ADR-036/037); absent ⇒ Exchange
+    pub allow_write: bool,                    // write gate (ADR-039): unsafe methods require this; admin-signed only
+    pub secret_ref: Option<String>,          // api_key: SecretResolver reference for the key; Some iff auth_mode == ApiKey
+    pub key_placement: Option<KeyPlacement>, // api_key: how the key is attached; Some iff auth_mode == ApiKey
 }
 // Used by: PolicyEngine (C4), IdentityBroker (C11), SandboxController (C13), McpUpstreamClient (C17).
 

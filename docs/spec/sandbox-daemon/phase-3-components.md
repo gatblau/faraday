@@ -31,7 +31,8 @@ All components are Rust modules in one binary (HLD ADR-026). Each carries Public
 
 **Public Interface.**
 - `pub fn load(env: &dyn Env, resolver: &dyn SecretResolver) -> Result<Config, ConfigError>` — parse, resolve `*_REF` secrets, validate; return an immutable `Config` or the first invalid field.
-- `pub trait SecretResolver { fn resolve(&self, reference: &str) -> Result<Vec<u8>, ConfigError>; }`
+- `pub trait SecretResolver { fn resolve(&self, reference: &str) -> Result<Vec<u8>, ConfigError>; }` — the secret-resolution SPI. Resolves both `PYS_*_REF` config secrets and each `api_key` capability's `secretRef` (ADR-036).
+- `pub struct FileSecretResolver` (impl `SecretResolver`) — the default resolver: treats the reference as a file path and reads its bytes (`CFG_SECRET_UNRESOLVED` on failure), matching the repo `*_REF` → file convention. **Keychain / workload-identity resolvers are a later phase** (the trait is the extension point; no non-file resolver is implemented yet).
 
 **Internal Logic.**
 1. Read every Phase-2D variable; apply defaults where unset.
@@ -110,7 +111,7 @@ Feature: AuditLogger
 ### C4 PolicyEngine
 **File:** `src/policy.rs` | **Dependencies:** Config · **derivedFromHld:** 0.4.1
 
-**Purpose.** Load the capability manifest fail-closed (admin-signed overrides only, ADR-021), resolve a `capabilityId` to a `ResolvedCapability`, and authorise a call: for a Rest capability, canonical-path/method/host allowlist; for an Mcp capability (ADR-034), the `toolAllow` tool-name allowlist; both plus per-run/session budget and step-up requirement.
+**Purpose.** Load the capability manifest fail-closed (admin-signed overrides only, ADR-021), resolve a `capabilityId` to a `ResolvedCapability`, and authorise a call: for a Rest capability, canonical-path/method/host allowlist; for an Mcp capability (ADR-034), the `toolAllow` tool-name allowlist; both plus per-run/session budget and step-up requirement. Load also validates each capability's `authMode` (ADR-036/037) — the `secretRef`/`keyPlacement` coherence for `api_key` and the step-up-inapplicability for `api_key`/`none` — and the write gate (ADR-039).
 
 **Public Interface.**
 - `pub fn load(cfg: &Config) -> Result<Manifest, PolicyError>` — load default + (if present and admin-signed) overlay; reject unsigned/invalid to the shipped default.
@@ -126,6 +127,8 @@ Feature: AuditLogger
 5. `cap.require_step_up` and the session's `id_token` `acr`/recency insufficient → `STEP_UP_REQUIRED` (carries the required `acr_values`/`max_age` for the C8 challenge). Manifest load fails closed if a capability requires step-up while no acceptable `acr` set is configured.
 6. **`authorise_tool` (Mcp, ADR-034).** `tool ∉ cap.tool_allow` → `MCP_TOOL_DENIED` (the advertised `tools/list` is never the authorisation surface); then apply the budget check (step 4) and the step-up check (step 5). No path canonicalisation or method check applies — an Mcp capability has no path or HTTP method.
 7. **Load-time kind validation (ADR-034).** Reject the manifest fail-closed (`CFG_INVALID` naming the capability) when a capability's fields contradict its `kind`: a Rest capability missing `host`/`pathAllow`/`methods` or carrying `serverUrl`/`toolAllow`; an Mcp capability missing `serverUrl`/`toolAllow` or carrying `host`/`pathAllow`/`methods`; or an Mcp `serverUrl` that is neither `https` nor a `http://127.0.0.1[:port]` loopback origin under the ADR-032 opt-in.
+8. **Load-time auth-mode validation (ADR-036/037).** A capability's `authMode` ∈ {`exchange` (default when omitted), `passthrough`, `none`, `api_key`}. Reject fail-closed (`CFG_INVALID` naming the capability) when: `exchange`/`passthrough` carry no `provider`; `requireStepUpAuth` is set on an `api_key`/`none` capability (step-up rides the user `id_token` `acr`, which those modes do not use); `api_key` is missing `secretRef` or `keyPlacement`; or `secretRef`/`keyPlacement` appear on any non-`api_key` capability. `passthrough` is honoured only in an admin-signed manifest (ADR-021); an `api_key` capability's `secretRef` is resolved once at startup via the `SecretResolver` (C1) and the key is frozen for the daemon's life. An Mcp capability with `authMode: exchange` is rejected (ADR-034 amendment: the obo-broker cannot drive a `tools/call`).
+9. **Load-time write gate (ADR-039).** A capability is read-only by default: if it declares any unsafe method (`POST`/`PUT`/`PATCH`/`DELETE`) without `allowWrite: true`, reject fail-closed (`CFG_INVALID`). `allowWrite` is honoured only in an admin-signed manifest — the signed policy is the pre-grant that authorises the write. Enforced in `load` for every manifest, all deployment profiles.
 
 **Error Table.**
 | Condition | Code | Status |
@@ -167,6 +170,18 @@ Feature: PolicyEngine
     Then it returns MCP_TOOL_DENIED (403) and the advertised tools/list is never consulted
   Scenario: Error — kind/allowlist mismatch rejected at load
     Given an mcp capability that also carries a host field
+    When load is called
+    Then the manifest is rejected fail-closed with CFG_INVALID naming the capability
+  Scenario: Error — api_key capability without keyPlacement rejected at load
+    Given a capability with authMode api_key and a secretRef but no keyPlacement
+    When load is called
+    Then the manifest is rejected fail-closed with CFG_INVALID naming the capability
+  Scenario: Error — secretRef on a non-api_key capability rejected at load
+    Given an exchange capability that also carries a secretRef
+    When load is called
+    Then the manifest is rejected fail-closed with CFG_INVALID naming the capability
+  Scenario: Error — unsafe method without the write opt-in rejected at load
+    Given a capability declaring POST without allowWrite
     When load is called
     Then the manifest is rejected fail-closed with CFG_INVALID naming the capability
 ```
@@ -507,9 +522,9 @@ Feature: McpUpstreamClient
 ---
 
 ### C11 IdentityBroker
-**File:** `src/broker.rs` | **Dependencies:** Config, AuditLogger, PolicyEngine, ResponseSanitizer, OboClient, DownstreamClient, McpUpstreamClient, keychain · **derivedFromHld:** 0.4.1
+**File:** `src/broker.rs` | **Dependencies:** Config, AuditLogger, PolicyEngine, ResponseSanitizer, OboClient, DownstreamClient, McpUpstreamClient, CredentialSource, ApiKeyStore · **derivedFromHld:** 0.4.1
 
-**Purpose.** The single source of truth for credentials: hold tokens, maintain the capability table, route a REST `{capId, verb, path}` call to OBO (exchange) or direct provider, or an MCP `{capId, tool, arguments}` call to the downstream MCP client (ADR-034), sanitise, and audit. Tokens never leave this module.
+**Purpose.** The single source of truth for credentials: hold tokens, maintain the capability table, route a REST `{capId, verb, path}` call by its `authMode` (ADR-036/037) — `exchange` (OBO), `passthrough`, `api_key`, or `none` — or an MCP `{capId, tool, arguments}` call to the downstream MCP client (ADR-034), sanitise, and audit. Tokens and static keys never leave this module. Two credential sources are injected: `CredentialSource` (the user's held `id_token`/`access_token`) and `ApiKeyStore` (the startup-frozen per-capability `api_key` keys, resolved once via the C1 `SecretResolver`).
 
 **Public Interface.**
 - `pub fn mint_caps(&self, principal: &Principal, run_id: &str, client_label: &str, caps: &[ResolvedCapability]) -> Vec<CapabilityHandle>`
@@ -519,7 +534,7 @@ Feature: McpUpstreamClient
 **Internal Logic.**
 1. `mint_caps`: generate a 128-bit `capId` per capability, valid ≤5 min, bound to the daemon instance; store `capId → ResolvedCapability + Principal + (run_id, client_label)` in the in-memory table. `run_id` is the server-minted run correlator and `client_label` the client-asserted label, bound here so each call's `AuditEntry` (step 4) is attributed to its run without per-run mutable broker state.
 2. `call`: look up `capId` (unknown/expired → `CAP_INVALID`); reject if `cap.kind != Rest` → `CAP_INVALID`; re-check host/path/method via `PolicyEngine.authorise`.
-3. Route by `cap.provider`: token-exchange → `OboClient.exchange` (surfaces step-up); direct → acquire the held token (OIDC session / keychain), apply via `DownstreamClient.do_call`.
+3. Route by `cap.auth_mode` (ADR-036/037): **`Exchange`** → `OboClient.exchange` with the user `id_token` as subject (surfaces step-up; downstream token minted server-side, never held here); **`Passthrough`** → apply the user's OIDC `access_token` as `Credential::Bearer` via `DownstreamClient.do_call`; **`ApiKey`** → look up the key by `secret_ref` in the startup-frozen `ApiKeyStore` (→ `KeyUnavailable` if absent), attach it at `cap.key_placement` — `Header { name, scheme? }` as `<name>: [<scheme> ]<key>`, or `Query { param }` as `?<param>=<key>` — and call via `DownstreamClient.do_call`; **`Unauthenticated`** → `DownstreamClient.do_call` with no credential applied. Every mode remains host/path/method-allowlisted, budgeted, and audited.
 4. Sanitize the raw response (C5) → `UntrustedResponse`; write an `AuditEntry` (C3); return. Never serialise a token into the result.
 5. **`call_tool` (Mcp, ADR-034).** Look up `capId` (unknown/expired → `CAP_INVALID`); reject if `cap.kind != Mcp` → `CAP_INVALID`; authorise via `PolicyEngine.authorise_tool` (`tool ∈ tool_allow`, budget, step-up); acquire the credential as in step 3 but limited to **`passthrough` / `api_key` / `none`** — `exchange` is **excluded for MCP** (ADR-034 amendment: the obo-broker makes the call itself server-side and cannot drive a `tools/call`; C4 rejects `mcp` + `exchange` at load); invoke `McpUpstreamClient.call_tool` (C17); sanitise the result via `ResponseSanitizer.sanitize_mcp` (C5) → `UntrustedMcpResult`; write an `AuditEntry` (C3 — `method="mcp.tools/call"`, `path=tool`, `host=server origin`); return. Never serialise a token into the result.
 
@@ -531,6 +546,7 @@ Feature: McpUpstreamClient
 | step-up required (from OBO) | STEP_UP_REQUIRED | 401 |
 | exchange/downstream failure | EXCHANGE_FAILED / DOWNSTREAM_* | 502/504 |
 | MCP upstream failure | MCP_UPSTREAM_* / MCP_PROTOCOL_ERROR | 502/504 |
+| api_key key unresolved at call time | API_KEY_UNAVAILABLE | 503 |
 | dependency unavailable | OBO_UNAVAILABLE / IDP_UNAVAILABLE | 503 |
 
 **Gherkin.**
@@ -540,10 +556,14 @@ Feature: IdentityBroker
     Given a minted capId for a token-exchange capability
     When call is invoked
     Then obo-broker is used and a sanitized UntrustedResponse is returned with no token
-  Scenario: Edge — direct provider uses the held token
-    Given a minted capId for a github capability
+  Scenario: Edge — passthrough forwards the user's access token
+    Given a minted capId for a passthrough capability
     When call is invoked
-    Then the held token is applied directly and the response is sanitized
+    Then the user's OIDC access_token is applied as a Bearer and the response is sanitized
+  Scenario: Edge — api_key applies the static key at its placement
+    Given a minted capId for an api_key capability with a header keyPlacement
+    When call is invoked
+    Then the startup-frozen key is attached at the configured header and the response is sanitized with no key in it
   Scenario: Error — expired capId
     Given a capId past its 5-minute validity
     When call is invoked

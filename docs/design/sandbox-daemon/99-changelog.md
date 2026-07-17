@@ -19,3 +19,13 @@ One line per HLD revision bump (folder-form requirement, D-HLD-6).
   requests a per-capability resource `audience` at sign-in so the IdP issues an access token
   audienced for the resource server, which validates it (RFC 01). No new component; consumes
   the existing `ResolvedCapability.audience`.
+
+> **Erratum (2026-07-15, no revision bump).** The auth-mode taxonomy the JSON schema
+> (`schema/pysandbox.policy.schema.json`) and the implementation already carried — per-capability
+> `authMode` (`exchange`/`passthrough`/`none`/`api_key`), the api_key `secretRef` + `keyPlacement`,
+> and the `allowWrite` write gate (shared-register ADR-036/ADR-037/ADR-039, recorded in
+> [`../faradayd-server-mode/09-decisions.md`](../faradayd-server-mode/09-decisions.md)) — was absent
+> from the `11-policy-schema.md` prose and the LLD specs (`phase-2` shared types; C1/C4/C11).
+> Reconciled in place (code → spec via `/sync-spec`) so the prose, the JSON schema, and the code
+> agree. A correction of docs that lagged an already-decided taxonomy — so **no revision bump and
+> no spec `derivedFromHld` re-pin**.
